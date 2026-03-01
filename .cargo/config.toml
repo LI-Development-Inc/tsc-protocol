@@ -1,0 +1,6 @@
+[target.'cfg(all())']
+rustflags = [
+    "-D", "warnings",
+    "-D", "missing_docs",
+    "-A", "dead_code" # Temporarily allow while bootstrapping
+]

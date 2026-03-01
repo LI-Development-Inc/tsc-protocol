@@ -1,0 +1,30 @@
+[package]
+name = "tsc-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Standard TSC logic
+tsc-crypto = { path = "../tsc-crypto" }
+
+# Networking stack
+quinn = "0.10"
+tokio = { workspace = true, features = ["full"] }
+rustls = { version = "0.21", features = ["quic", "dangerous_configuration"] }
+
+# Traffic Morphing & Serialization
+rand = "0.8"
+bincode = { workspace = true }
+serde = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek.workspace = true
+
+# Self sign certificates
+rcgen = "0.11"
+
+# p2p layer
+libp2p = { version = "0.53", features = ["tcp", "tls", "dns", "tokio", "noise", "yamux", "kad", "mdns", "macros"] }
+
+
+# DHT Cryptography
+aes-gcm = "0.10"

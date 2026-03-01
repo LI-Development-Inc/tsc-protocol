@@ -1,0 +1,16 @@
+[package]
+name = "tsc-cli"
+version.workspace = true
+edition.workspace = true
+description = "Sovereign Command Line Interface for the Standalone Complex"
+
+[dependencies]
+# Standard async runtime for networking
+tokio = { version = "1.30", features = ["full"] }
+
+# For future structured command serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# Link to our internal crypto for GhostID validation in later phases
+tsc-crypto = { path = "../tsc-crypto" }

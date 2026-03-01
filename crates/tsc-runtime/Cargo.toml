@@ -1,0 +1,21 @@
+[package]
+name = "tsc-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Standard TSC logic
+tsc-crypto = { path = "../tsc-crypto" }
+tsc-net = { path = "../tsc-net" }
+
+# System & Containerization
+nix = { version = "0.27", features = ["feature", "user", "process", "sched"] }
+libc = "0.2"
+
+# Legacy Bridging
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.5"
+
+# Serialization
+serde = { workspace = true }

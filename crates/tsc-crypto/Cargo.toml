@@ -1,0 +1,18 @@
+[package]
+name = "tsc-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bip39 = { version = "2.0", features = ["rand"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek.workspace = true
+blake3.workspace = true
+# argon2.workspace = true
+
+argon2 = { version = "0.5", features = ["password-hash"] }
+serde.workspace = true
+serde_json.workspace = true
+hex = "0.4" # Added for KERI key decoding
+aes-gcm = "0.10"
+rand = "0.10.0"

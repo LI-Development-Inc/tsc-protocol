@@ -1,0 +1,33 @@
+# /standalone-complex/Cargo.toml
+[workspace]
+members = [
+    "crates/tsc-crypto",
+    "crates/tsc-net",
+    "crates/tsc-runtime",
+    "crates/tscd",
+    "crates/tsc-cli"
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Anonymous Lead Engineer"]
+license = "GPL-3.0-or-later" # Aligning with FOSS principles
+
+[workspace.dependencies]
+# Core Cryptography
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+x25519-dalek = "2.0"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0" # For Canonical JSON (RFC 8785)
+bincode = "1.3"
+
+# Async & Networking
+tokio = { version = "1.35", features = ["full"] }
+quinn = "0.10"
