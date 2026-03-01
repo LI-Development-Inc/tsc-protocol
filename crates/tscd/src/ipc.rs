@@ -1,156 +1,272 @@
-//! IPC communication over Unix Domain Sockets with Peer Authentication.
+//! IPC server over Unix Domain Sockets (RFC-003).
 //!
-//! This module implements the TSCD Shell's primary control interface, allowing
-//! the CLI or WASM-based frontends to interact with the daemon securely.
+//! Authentication: `SO_PEERCRED` — caller UID must match the daemon owner or be root.
+//! Framing: u32 little-endian length prefix (from `tsc_proto::read_framed` / `write_framed`).
+//! Types: `GhostCommand` / `GhostResponse` from `tsc-proto` (RFC-011, ADR-007).
 
-use tokio::net::UnixListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use nix::unistd::Uid; 
-use std::os::unix::io::AsFd;
-use serde::{Serialize, Deserialize};
 use std::sync::Arc;
+use tokio::net::UnixListener;
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::unistd::Uid;
+use std::os::unix::io::AsFd;
 
-// Internal TSC imports
-use tsc_net::NetStack; // Fix: Import NetStack
-use tsc_net::dht::GhostDiscovery; // Fix: Import GhostDiscovery
+use tsc_net::dht::GhostDiscovery;
+use tsc_net::NetStack;
+use tsc_proto::{
+    read_framed, write_framed, DaemonStatus, GhostCommand, GhostResponse, VaultState,
+};
 
-/// Structured commands for the Shell.
-#[derive(Serialize, Deserialize, Debug)]
-pub enum GhostCommand {
-    /// Check Shell health (Heartbeat).
-    Ping,
-    /// Initialize a new Sovereign Identity and generate a root mnemonic.
-    InitIdentity,
-    /// Check the status of the local vault and verify identity integrity.   
-    Status,
-    /// Connect to a Ghost by its ID, triggering DHT resolution and network connection.
-    Connect(String), 
-    /// Send an encrypted string to a resolved GhostID.
-    SendMessage {
-        /// The target GhostID to send the message to.
-        target_id: String, 
-        /// The plaintext content to be encrypted and sent.
-        content: String },
-}
-
-/// Structured responses from the Shell.
-#[derive(Serialize, Deserialize, Debug)]
-pub enum GhostResponse {
-    /// Generic success message.
-    Ok(String),
-    /// The 24-word Mnemonic generated during initialization.
-    Mnemonic(Vec<String>),
-    /// Standardized error message.
-    Err(String),
-    /// Success response confirming the identity is verified and locked.
-    IdentityFound(String),
-    /// Response confirming a successful connection to a Ghost.
-    LinkEstablished(String),
-    /// Confirmation that a message was sent to the target Ghost.
-    MessageSent(String),
-}
-
-/// The IPC server responsible for handling local control commands via Unix Domain Sockets.
+/// The IPC server that handles CLI → daemon commands.
 pub struct IpcServer {
-    /// The filesystem path where the Unix Domain Socket will be created.
+    /// Filesystem path for the Unix Domain Socket.
     pub socket_path: String,
+    /// The resolved Persona (None in ephemeral mode).
+    pub persona: Option<tsc_crypto::Persona>,
 }
-/// The IPC server implementation.
+
 impl IpcServer {
-    /// Starts the IPC server, listening for incoming commands and responding accordingly.
+    /// Starts the IPC listener loop.
     pub async fn start(
-        &self, 
-        net: Arc<NetStack>, 
-        discovery: Arc<GhostDiscovery>
+        self,
+        net: Arc<NetStack>,
+        discovery: Arc<GhostDiscovery>,
     ) -> tokio::io::Result<()> {
+        // Clean up stale socket from a previous run
         let _ = std::fs::remove_file(&self.socket_path);
         let listener = UnixListener::bind(&self.socket_path)?;
-        
+
+        // Tighten socket permissions to owner-only
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &self.socket_path,
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
+
+        println!("[*] IPC: Listening on {}", self.socket_path);
+
+        let start_time = std::time::Instant::now();
+        // The ghost_id for status responses
+        let ghost_id = self
+            .persona
+            .as_ref()
+            .map(|p| p.ghost_id.clone())
+            .unwrap_or_else(|| "ephemeral".to_string());
+
         loop {
-            let (mut stream, _) = listener.accept().await?;
-            
+            let (stream, _) = listener.accept().await?;
+
+            // ── Peer credential check (RFC-003 §3.1) ──────────────────────
             if let Ok(creds) = getsockopt(&stream.as_fd(), PeerCredentials) {
-                if Uid::from_raw(creds.uid()) != Uid::current() && !Uid::from_raw(creds.uid()).is_root() {
-                    continue; 
+                let caller_uid = Uid::from_raw(creds.uid());
+                if caller_uid != Uid::current() && !caller_uid.is_root() {
+                    eprintln!("[!] IPC: Rejected connection from UID {}", creds.uid());
+                    continue;
                 }
             }
-            
-            let net_stack = Arc::clone(&net);
-            let disc_stack = Arc::clone(&discovery);
+
+            let net_stack   = Arc::clone(&net);
+            let disc_stack  = Arc::clone(&discovery);
+            let ghost_id_c  = ghost_id.clone();
+            let uptime_fn   = start_time;
 
             tokio::spawn(async move {
-                let mut buffer = [0u8; 1024];
-                if let Ok(n) = stream.read(&mut buffer).await {
-                    if n == 0 { return; }
-                    
-                    let cmd: GhostCommand = bincode::deserialize(&buffer[..n]).unwrap_or(GhostCommand::Ping);
-                    
-                    let response = match cmd {
-                        GhostCommand::Ping => GhostResponse::Ok("TSC_PULSE_OK".into()),
-                        GhostCommand::Connect(target_id) => {
-                            match net_stack.resolve_ghost(target_id.clone(), &disc_stack).await {
-                                Some(addr) => GhostResponse::LinkEstablished(
-                                    format!("Ghost {} resolved to {}", target_id, addr)
-                                ),
-                                None => GhostResponse::Err("GhostID not found in DHT".into()),
-                            }
-                        },
-                        GhostCommand::InitIdentity => {
-                            match tsc_crypto::vault::generate_mnemonic() {
-                                Ok(words) => {
-                                    // 1. Generate the actual persona from the seed
-                                    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-                                    let persona = tsc_crypto::Persona::new_with_history(signing_key, [0u8; 32]);
-                                    
-                                    // 2. Lock it in the vault
-                                    let hw_uuid = tsc_crypto::vault::get_hardware_uuid();
-                                    let ks = tsc_crypto::vault::derive_storage_key(&persona, &hw_uuid);
-                                    
-                                    if let Ok(_) = tsc_crypto::vault::lock_vault(words.clone(), &ks) {
-                                        // 3. SUCCESS: Send the words back to the CLI
-                                        println!("[+] IPC: New Identity Created: {}", persona.ghost_id);
-                                        GhostResponse::Mnemonic(words)
-                                    } else {
-                                        GhostResponse::Err("Vault Lock Failed".into())
-                                    }
-                                },
-                                Err(e) => GhostResponse::Err(format!("Entropy Error: {}", e)),
-                            }
-                        },
-                        GhostCommand::Status => {
-                            let hw_uuid = tsc_crypto::vault::get_hardware_uuid();
-                            GhostResponse::IdentityFound(format!("Hardware UUID: {}", hw_uuid))
-                        }
-                        GhostCommand::SendMessage { target_id, content } => {
-                            // 1. Resolve the address
-                            if let Some(addr) = net_stack.resolve_ghost(target_id.clone(), &disc_stack).await {
-                                // 2. Establish GSP Connection
-                                match net_stack.connect(addr).await {
-                                    Ok(conn) => {
-                                        // 3. Open a stream and write the content
-                                        if let Ok(mut stream) = conn.open_ghost_stream().await {
-                                            let _ = stream.write_all(content.as_bytes()).await;
-                                            let _ = stream.finish().await; // Close the stream cleanly
-                                            GhostResponse::MessageSent(format!("Payload delivered to {}", target_id))
-                                        } else {
-                                            GhostResponse::Err("Failed to open data stream".into())
-                                        }
-                                    },
-                                    Err(e) => GhostResponse::Err(format!("GSP Handshake Failed: {}", e)),
-                                }
-                            } else {
-                                GhostResponse::Err("Target Ghost offline or unreachable".into())
-                            }
-                        },
-                    };
-
-                    if let Ok(resp_bytes) = bincode::serialize(&response) {
-                        let _ = stream.write_all(&resp_bytes).await;
-                        let _ = stream.shutdown().await;
-                    }
-                }
+                handle_connection(stream, net_stack, disc_stack, ghost_id_c, uptime_fn).await;
             });
+        }
+    }
+}
+
+/// Handles a single accepted IPC connection.
+async fn handle_connection(
+    mut stream: tokio::net::UnixStream,
+    net: Arc<NetStack>,
+    discovery: Arc<GhostDiscovery>,
+    ghost_id: String,
+    started: std::time::Instant,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    // Split into reader/writer so we can hold them simultaneously
+    let (mut reader, mut writer) = stream.split();
+
+    let cmd = match read_framed::<_, GhostCommand>(&mut reader).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return, // clean EOF
+        Err(e) => {
+            eprintln!("[!] IPC: Frame read error: {}", e);
+            return;
+        }
+    };
+
+    let response = dispatch_command(cmd, &net, &discovery, &ghost_id, started).await;
+
+    if let Err(e) = write_framed(&mut writer, &response).await {
+        eprintln!("[!] IPC: Frame write error: {}", e);
+    }
+    let _ = writer.shutdown().await;
+}
+
+/// Routes a `GhostCommand` to the appropriate handler and returns a `GhostResponse`.
+async fn dispatch_command(
+    cmd: GhostCommand,
+    net: &Arc<NetStack>,
+    discovery: &Arc<GhostDiscovery>,
+    ghost_id: &str,
+    started: std::time::Instant,
+) -> GhostResponse {
+    match cmd {
+        // ── Ping ───────────────────────────────────────────────────────────
+        GhostCommand::Ping => GhostResponse::Ok("TSC_PULSE_OK".into()),
+
+        // ── Status ─────────────────────────────────────────────────────────
+        GhostCommand::Status => {
+            GhostResponse::Status(DaemonStatus {
+                ghost_id: ghost_id.to_string(),
+                vault_state: if ghost_id.starts_with("ephemeral") {
+                    VaultState::Ephemeral
+                } else {
+                    VaultState::Unlocked
+                },
+                peer_count: 0,    // TODO: query libp2p swarm peer count
+                active_ghosts: 0, // TODO: query runtime Ghost registry
+                uptime_secs: started.elapsed().as_secs(),
+            })
+        }
+
+        // ── Init Identity ──────────────────────────────────────────────────
+        GhostCommand::InitIdentity => {
+            let hw_uuid = tsc_crypto::vault::get_hardware_uuid();
+            let vault_path = match tsc_crypto::vault::vault_path() {
+                Ok(p) => p,
+                Err(e) => return GhostResponse::Err(format!("{}", e)),
+            };
+
+            // Generate entropy and derive seed
+            let (phrase, master_seed) = tsc_crypto::bip39::generate_sovereign_entropy();
+            let words: Vec<String> = phrase.split_whitespace().map(|s| s.to_string()).collect();
+
+            // Derive persona to get K1 for the vault KDF
+            let persona = match tsc_crypto::Persona::from_seed(&master_seed) {
+                Ok(p) => p,
+                Err(e) => return GhostResponse::Err(format!("{}", e)),
+            };
+
+            let k1 = match tsc_crypto::bip39::derive_active_key(&master_seed) {
+                Ok(k) => k,
+                Err(e) => return GhostResponse::Err(format!("{}", e)),
+            };
+            let key_material = k1.to_bytes();
+
+            // Lock vault
+            if let Err(e) = tsc_crypto::vault::lock_vault(&words, &key_material, &hw_uuid, &vault_path) {
+                return GhostResponse::Err(format!("{}", e));
+            }
+
+            println!("[+] IPC: New Identity Created: {}", persona.ghost_id);
+            GhostResponse::Mnemonic(words)
+        }
+
+        // ── Recover Identity ───────────────────────────────────────────────
+        GhostCommand::RecoverIdentity { mnemonic } => {
+            let hw_uuid = tsc_crypto::vault::get_hardware_uuid();
+            let vault_path = match tsc_crypto::vault::vault_path() {
+                Ok(p) => p,
+                Err(e) => return GhostResponse::Err(format!("{}", e)),
+            };
+
+            let master_seed = match tsc_crypto::bip39::restore_from_phrase(&mnemonic) {
+                Ok(s) => s,
+                Err(e) => return GhostResponse::Err(format!("{}", e)),
+            };
+
+            let words: Vec<String> = mnemonic.split_whitespace().map(|s| s.to_string()).collect();
+            let k1 = match tsc_crypto::bip39::derive_active_key(&master_seed) {
+                Ok(k) => k,
+                Err(e) => return GhostResponse::Err(format!("{}", e)),
+            };
+
+            if let Err(e) = tsc_crypto::vault::lock_vault(&words, &k1.to_bytes(), &hw_uuid, &vault_path) {
+                return GhostResponse::Err(format!("{}", e));
+            }
+            GhostResponse::Ok("IDENTITY:RECOVERED: Vault written. Restart tscd to load the new identity.".into())
+        }
+
+        // ── Resolve ────────────────────────────────────────────────────────
+        GhostCommand::Resolve { ghost_id: target_id } => {
+            match net.resolve_ghost(target_id.clone(), discovery).await {
+                Some(addr) => GhostResponse::Resolved {
+                    ghost_id: target_id,
+                    addr: addr.to_string(),
+                },
+                None => GhostResponse::Err(
+                    "NET:NOT_FOUND: GhostID not found in DHT".into(),
+                ),
+            }
+        }
+
+        // ── Connect ────────────────────────────────────────────────────────
+        GhostCommand::Connect { ghost_id: target_id } => {
+            match net.resolve_ghost(target_id.clone(), discovery).await {
+                Some(addr) => GhostResponse::LinkEstablished {
+                    remote_id: target_id,
+                    addr: addr.to_string(),
+                },
+                None => GhostResponse::Err(
+                    "NET:NOT_FOUND: GhostID not found in DHT or offline".into(),
+                ),
+            }
+        }
+
+        // ── SendMessage ────────────────────────────────────────────────────
+        GhostCommand::SendMessage { target_id, content } => {
+
+            let addr = match net.resolve_ghost(target_id.clone(), discovery).await {
+                Some(a) => a,
+                None => {
+                    return GhostResponse::Err(
+                        "NET:NOT_FOUND: Target Ghost offline or unreachable".into(),
+                    )
+                }
+            };
+
+            match net.connect(addr).await {
+                Ok(conn) => match conn.open_ghost_stream().await {
+                    Ok(mut send) => {
+                        let _ = send.write_all(content.as_bytes()).await;
+                        let _ = send.finish().await;
+                        GhostResponse::MessageSent { target_id }
+                    }
+                    Err(e) => GhostResponse::Err(
+                        format!("NET:STREAM_OPEN: Failed to open data stream: {}", e),
+                    ),
+                },
+                Err(e) => GhostResponse::Err(
+                    format!("NET:CONNECT: GSP handshake failed: {}", e),
+                ),
+            }
+        }
+
+        // ── Ghost lifecycle (Phase 3) ──────────────────────────────────────
+        GhostCommand::SpawnGhost { image_hash, vault_id: _ } => {
+            GhostResponse::Err(format!(
+                "RUNTIME:NOT_IMPL: SpawnGhost({}) — Phase 3 work pending",
+                image_hash
+            ))
+        }
+        GhostCommand::ListGhosts => {
+            GhostResponse::GhostList(vec![])
+        }
+        GhostCommand::StopGhost { ghost_id } => {
+            GhostResponse::Err(format!(
+                "RUNTIME:NOT_IMPL: StopGhost({}) — Phase 3 work pending",
+                ghost_id
+            ))
+        }
+        GhostCommand::RotateKey => {
+            GhostResponse::Err("IDENTITY:NOT_IMPL: RotateKey — Phase 1.1 work pending".into())
         }
     }
 }

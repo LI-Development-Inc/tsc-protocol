@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use bincode; 
 use tsc_crypto::keri::InceptionEvent;
 
-/// GSP Message Types: Control, Data, and Migration.
+/// GSP Message Types: Control, Data, Migration, and Chaff.
 #[repr(u8)]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum MsgType {
@@ -15,6 +15,8 @@ pub enum MsgType {
     Data = 0x02,
     /// Ghost migration events.
     Migration = 0x03,
+    /// Traffic morphing padding — silently discarded by receivers (RFC-001 §1.6).
+    Chaff = 0xFF,
 }
 
 /// The initial handshake message for GSP peers.

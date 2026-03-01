@@ -1,80 +1,238 @@
 //! TSC-CLI: Sovereign Controller for the Standalone Complex Shell.
-mod proto;
-use proto::{GhostCommand, GhostResponse};
+//!
+//! Connects to the `tscd` daemon via Unix Domain Socket and dispatches
+//! commands using the shared `tsc-proto` IPC protocol (RFC-003, ADR-007).
 
 use tokio::net::UnixStream;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tsc_proto::{read_framed, write_framed, DaemonStatus, GhostCommand, GhostResponse, VaultState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let socket_path = "/tmp/tscd.sock";
-    
-    // 1. Updated Argument Parser
-    let cmd = if args.len() > 1 {
-        match args[1].as_str() {
-            "init" => GhostCommand::InitIdentity,
-            "status" => GhostCommand::Status,
-            "connect" => {
-                if args.len() > 2 {
-                    GhostCommand::Connect(args[2].clone())
-                } else {
-                    println!("[!] Error: 'connect' requires a target GhostID.");
-                    return Ok(());
-                }
-            },
-            // NEW: Handle the 'send' command
-            "send" => {
-                if args.len() > 3 {
-                    GhostCommand::SendMessage {
-                        target_id: args[2].clone(),
-                        content: args[3].clone(),
-                    }
-                } else {
-                    println!("[!] Usage: ./tsc-cli send <GHOST_ID> \"<MESSAGE>\"");
-                    return Ok(());
-                }
-            },
-            _ => GhostCommand::Ping,
-        }
-    } else {
-        GhostCommand::Ping 
-    };
 
-    // 2. Connection Logic
-    let mut stream = UnixStream::connect(socket_path).await
-        .map_err(|e| format!("[-] Connect Error: {}. Is tscd running?", e))?;
+    let cmd = parse_command(&args)?;
+    let socket_path = resolve_socket_path();
 
-    // 3. Transmission
-    let encoded = bincode::serialize(&cmd)?;
-    stream.write_all(&encoded).await?;
-    stream.shutdown().await?;
+    let mut stream = UnixStream::connect(&socket_path).await.map_err(|e| {
+        format!(
+            "CLI:CONNECT: Cannot reach tscd at '{}': {}. Is the daemon running?",
+            socket_path, e
+        )
+    })?;
 
-    // 4. Collect Response
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    
-    let resp: GhostResponse = bincode::deserialize(&buf)
-        .map_err(|e| format!("[-] Failed to decode Shell response: {}", e))?;
+    write_framed(&mut stream, &cmd).await?;
 
-    // 5. Updated Response Handler
-    match resp {
-        GhostResponse::Ok(msg) => println!("[<] Shell Pulse: {}", msg),
-        GhostResponse::IdentityFound(msg) => println!("[+] Success: {}", msg),
-        GhostResponse::Mnemonic(words) => {
-            println!("\n--- SOVEREIGN IDENTITY INITIALIZED ---");
-            println!("CRITICAL: Write down these 24 words. They are your Master Seed.");
-            println!("\n{}\n", words.join(" "));
-            println!("--------------------------------------");
-        },
-        GhostResponse::LinkEstablished(peer_id) => {
-            println!("[+] GSP Link Active: Successfully routed to Ghost {}", peer_id);
-        },
-        GhostResponse::MessageSent(details) => {
-            println!("[+] Egress Success: {}", details);
-        },
-        GhostResponse::Err(e) => println!("[!] Shell Error: {}", e),
+    let response = read_framed::<_, GhostResponse>(&mut stream)
+        .await?
+        .ok_or("CLI:EOF: Daemon closed connection without responding")?;
+
+    print_response(response);
+    Ok(())
+}
+
+// ── Command parsing ────────────────────────────────────────────────────────
+
+fn parse_command(args: &[String]) -> Result<GhostCommand, String> {
+    if args.len() < 2 {
+        return Ok(GhostCommand::Ping);
     }
 
-    Ok(())
+    match args[1].as_str() {
+        "ping"    => Ok(GhostCommand::Ping),
+        "init"    => Ok(GhostCommand::InitIdentity),
+        "status"  => Ok(GhostCommand::Status),
+
+        "recover" => {
+            if args.len() < 3 {
+                Err("Usage: tsc-cli recover \"<24 mnemonic words>\"".into())
+            } else {
+                Ok(GhostCommand::RecoverIdentity {
+                    mnemonic: args[2..].join(" "),
+                })
+            }
+        }
+
+        "resolve" => {
+            if args.len() < 3 {
+                Err("Usage: tsc-cli resolve <GHOST_ID>".into())
+            } else {
+                Ok(GhostCommand::Resolve { ghost_id: args[2].clone() })
+            }
+        }
+
+        "connect" => {
+            if args.len() < 3 {
+                Err("Usage: tsc-cli connect <GHOST_ID>".into())
+            } else {
+                Ok(GhostCommand::Connect { ghost_id: args[2].clone() })
+            }
+        }
+
+        "send" => {
+            if args.len() < 4 {
+                Err("Usage: tsc-cli send <GHOST_ID> \"<message>\"".into())
+            } else {
+                Ok(GhostCommand::SendMessage {
+                    target_id: args[2].clone(),
+                    content:   args[3..].join(" "),
+                })
+            }
+        }
+
+        "spawn" => {
+            if args.len() < 3 {
+                Err("Usage: tsc-cli spawn <IMAGE_HASH> [VAULT_ID]".into())
+            } else {
+                Ok(GhostCommand::SpawnGhost {
+                    image_hash: args[2].clone(),
+                    vault_id:   args.get(3).cloned(),
+                })
+            }
+        }
+
+        "list"   => Ok(GhostCommand::ListGhosts),
+
+        "stop" => {
+            if args.len() < 3 {
+                Err("Usage: tsc-cli stop <GHOST_ID>".into())
+            } else {
+                Ok(GhostCommand::StopGhost { ghost_id: args[2].clone() })
+            }
+        }
+
+        "rotate-key" => Ok(GhostCommand::RotateKey),
+
+        "help" | "--help" | "-h" => {
+            print_help();
+            std::process::exit(0);
+        }
+
+        other => Err(format!(
+            "CLI:UNKNOWN_CMD: '{}'. Run 'tsc-cli help' for usage.",
+            other
+        )),
+    }
+}
+
+// ── Response printing ──────────────────────────────────────────────────────
+
+fn print_response(resp: GhostResponse) {
+    match resp {
+        GhostResponse::Ok(msg) => println!("[+] {}", msg),
+
+        GhostResponse::Err(e) => eprintln!("[!] Error: {}", e),
+
+        GhostResponse::Mnemonic(words) => {
+            println!();
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("  SOVEREIGN IDENTITY INITIALIZED");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!();
+            println!("  CRITICAL: Write down these 24 words and store");
+            println!("  them securely offline. This is your Master Seed.");
+            println!("  If you lose it, your identity is unrecoverable.");
+            println!();
+            // Print in 4 columns of 6
+            for (i, word) in words.iter().enumerate() {
+                print!("  {:2}. {:<12}", i + 1, word);
+                if (i + 1) % 4 == 0 { println!(); }
+            }
+            println!();
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        }
+
+        GhostResponse::Status(s) => print_status(s),
+
+        GhostResponse::Resolved { ghost_id, addr } => {
+            println!("[+] Resolved: {} → {}", ghost_id, addr);
+        }
+
+        GhostResponse::LinkEstablished { remote_id, addr } => {
+            println!("[+] GSP Link Active: {} @ {}", remote_id, addr);
+        }
+
+        GhostResponse::MessageSent { target_id } => {
+            println!("[+] Message delivered to {}", target_id);
+        }
+
+        GhostResponse::GhostSpawned { pid, virtual_ip } => {
+            println!("[+] Ghost running: PID={} IP={}", pid, virtual_ip);
+        }
+
+        GhostResponse::GhostList(ghosts) => {
+            if ghosts.is_empty() {
+                println!("[*] No Ghosts currently running.");
+            } else {
+                println!("{:<20} {:>8}  {:<24} {}", "GHOST_ID", "PID", "VIRTUAL_IP", "UPTIME");
+                for g in ghosts {
+                    println!(
+                        "{:<20} {:>8}  {:<24} {}s",
+                        &g.ghost_id[..20.min(g.ghost_id.len())],
+                        g.pid,
+                        g.virtual_ip,
+                        g.uptime_secs
+                    );
+                }
+            }
+        }
+
+        GhostResponse::GhostStopped { ghost_id } => {
+            println!("[+] Ghost {} stopped.", ghost_id);
+        }
+
+        GhostResponse::KeyRotated { new_public_key } => {
+            println!("[+] Key rotated. New public key: {}", new_public_key);
+        }
+    }
+}
+
+fn print_status(s: DaemonStatus) {
+    let vault_str = match s.vault_state {
+        VaultState::Unlocked  => "Unlocked ✓",
+        VaultState::Locked    => "Locked ✗",
+        VaultState::Ephemeral => "Ephemeral (no vault)",
+    };
+    println!();
+    println!("  GhostID  : {}", s.ghost_id);
+    println!("  Vault    : {}", vault_str);
+    println!("  Peers    : {}", s.peer_count);
+    println!("  Ghosts   : {}", s.active_ghosts);
+    println!("  Uptime   : {}s", s.uptime_secs);
+    println!();
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Resolves the daemon socket path.
+///
+/// Matches the resolution logic in `tscd/src/main.rs`.
+fn resolve_socket_path() -> String {
+    if let Some(runtime_dir) = dirs::runtime_dir() {
+        let path = runtime_dir.join("tsc").join("tscd.sock");
+        if path.exists() {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    "/tmp/tscd.sock".to_string()
+}
+
+fn print_help() {
+    println!("tsc-cli — Standalone Complex Controller");
+    println!();
+    println!("USAGE:");
+    println!("  tsc-cli <COMMAND> [ARGS]");
+    println!();
+    println!("COMMANDS:");
+    println!("  ping                        Heartbeat check");
+    println!("  init                        Create a new sovereign identity");
+    println!("  recover \"<mnemonic>\"        Restore identity from 24-word seed");
+    println!("  status                      Show daemon status");
+    println!("  resolve <GHOST_ID>          Resolve a GhostID to a network address");
+    println!("  connect <GHOST_ID>          Establish a GSP link");
+    println!("  send <GHOST_ID> <msg>       Send an encrypted message");
+    println!("  spawn <IMAGE_HASH> [VAULT]  Spawn a Ghost-Box");
+    println!("  list                        List running Ghosts");
+    println!("  stop <GHOST_ID>             Stop a running Ghost");
+    println!("  rotate-key                  Rotate the active signing key (KERI)");
+    println!("  help                        Show this message");
 }

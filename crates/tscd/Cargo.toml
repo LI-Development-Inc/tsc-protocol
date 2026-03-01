@@ -2,23 +2,30 @@
 name = "tscd"
 version.workspace = true
 edition.workspace = true
+description = "The Shell — TSC privileged daemon"
 
 [dependencies]
-# TSC Workspace Crates
-tsc-crypto = { path = "../tsc-crypto" }
-tsc-net = { path = "../tsc-net" }
+# TSC crates
+tsc-crypto  = { path = "../tsc-crypto" }
+tsc-net     = { path = "../tsc-net" }
 tsc-runtime = { path = "../tsc-runtime" }
+tsc-proto   = { path = "../tsc-proto" }
 
-# Orchestration & CLI
-tokio = { workspace = true, features = ["full"] }
-clap = { version = "4.4", features = ["derive"] } # CLI parsing
-ctrlc = "3.4" # Graceful shutdown logic
+# Async runtime
+tokio = { workspace = true }
 
-# IPC
-nix = { version = "0.27", features = ["user", "socket", "fs"] }
-libc = "0.2"
+# IPC peer auth
+nix = { workspace = true }
 
-serde = { workspace = true, features = ["derive"] }
-bincode = "1.3"
-ed25519-dalek = "2.0"
-rand = "0.8"
+# Key derivation helpers (for DHT key)
+hkdf  = { workspace = true }
+sha2  = { workspace = true }
+
+# Path resolution
+dirs  = { workspace = true }
+
+# Key material
+ed25519-dalek = { workspace = true }
+blake3        = { workspace = true }
+hex           = { workspace = true }
+rand          = { workspace = true }

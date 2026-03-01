@@ -19,7 +19,7 @@ pub async fn send_chaff_stream(tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
         sleep(Duration::from_millis(jitter)).await;
 
         let frame = crate::gsp::GspFrame::new(
-            crate::gsp::MsgType::Data, 
+            crate::gsp::MsgType::Chaff,
             chaff_payload
         );
 

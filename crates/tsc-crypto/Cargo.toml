@@ -2,17 +2,32 @@
 name = "tsc-crypto"
 version.workspace = true
 edition.workspace = true
+description = "Identity Domain (Root of Trust) for the Standalone Complex"
 
 [dependencies]
-bip39 = { version = "2.0", features = ["rand"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
-ed25519-dalek.workspace = true
-blake3.workspace = true
-# argon2.workspace = true
+# Key derivation
+bip39             = { workspace = true }
+hkdf              = { workspace = true }
+sha2              = { workspace = true }
+hmac              = { workspace = true }
 
-argon2 = { version = "0.5", features = ["password-hash"] }
-serde.workspace = true
-serde_json.workspace = true
-hex = "0.4" # Added for KERI key decoding
-aes-gcm = "0.10"
-rand = "0.10.0"
+# Signing & hashing
+ed25519-dalek     = { workspace = true }
+blake3            = { workspace = true }
+hex               = { workspace = true }
+zeroize           = { workspace = true }
+
+# Vault KDF & AEAD
+argon2            = { workspace = true }
+chacha20poly1305  = { workspace = true }
+rand              = { workspace = true }
+
+# Serialization
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+
+# Path resolution
+dirs              = { workspace = true }
+
+# Error handling
+thiserror         = { workspace = true }

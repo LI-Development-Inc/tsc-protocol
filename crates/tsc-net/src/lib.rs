@@ -54,9 +54,16 @@ pub struct NetStack {
     /// The local GhostID associated with this network stack.
     pub local_id: String,
 }
-/// Custom certificate verifier that skips verification for testing purposes.
+/// Custom certificate verifier that skips TLS certificate verification.
+///
+/// **ONLY compiled in when the `dev` feature is enabled.**
+/// Identity verification is performed at the GSP handshake layer (RFC-001 §1.5);
+/// this verifier exists solely to allow self-signed QUIC certs during development.
+/// It MUST NOT be present in production/release builds (ADR-008).
+#[cfg(feature = "dev")]
 struct SkipServerVerification;
 
+#[cfg(feature = "dev")]
 impl rustls::client::ServerCertVerifier for SkipServerVerification {
     fn verify_server_cert(
         &self,
@@ -156,11 +163,19 @@ impl NetStack {
     }
     /// Establishes a QUIC connection to a remote address and returns a GSP connection wrapper.
     pub async fn connect(&self, addr: SocketAddr) -> NetResult<GspConnection> {
-        // Build a client configuration that accepts our self-signed certs
+        // In dev mode: skip TLS cert verification (identity checked via GSP handshake).
+        // In release mode: proper cert verification is required — see ADR-008.
+        #[cfg(feature = "dev")]
         let crypto = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification))
             .with_no_client_auth();
+
+        #[cfg(not(feature = "dev"))]
+        compile_error!(
+            "Release builds require a proper TLS verifier. \
+             Implement KERI-based peer verification per ADR-008 before removing the dev feature."
+        );
 
         let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(crypto));
         

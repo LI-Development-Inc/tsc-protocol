@@ -2,29 +2,33 @@
 name = "tsc-net"
 version.workspace = true
 edition.workspace = true
+description = "Transport Domain (The Pipe) for the Standalone Complex"
+
+[features]
+# Enables self-signed TLS cert acceptance for local development.
+# MUST NOT be enabled in production builds. See ADR-008.
+dev = []
 
 [dependencies]
-# Standard TSC logic
 tsc-crypto = { path = "../tsc-crypto" }
 
-# Networking stack
-quinn = "0.10"
-tokio = { workspace = true, features = ["full"] }
-rustls = { version = "0.21", features = ["quic", "dangerous_configuration"] }
+# Networking
+quinn   = { workspace = true }
+tokio   = { workspace = true }
+rustls  = { workspace = true }
+rcgen   = { workspace = true }
 
-# Traffic Morphing & Serialization
-rand = "0.8"
+# P2P
+libp2p  = { workspace = true }
+
+# Crypto
+blake3        = { workspace = true }
+ed25519-dalek = { workspace = true }
+aes-gcm       = { workspace = true }
+
+# Serialization
 bincode = { workspace = true }
-serde = { workspace = true }
-blake3 = { workspace = true }
-ed25519-dalek.workspace = true
+serde   = { workspace = true }
 
-# Self sign certificates
-rcgen = "0.11"
-
-# p2p layer
-libp2p = { version = "0.53", features = ["tcp", "tls", "dns", "tokio", "noise", "yamux", "kad", "mdns", "macros"] }
-
-
-# DHT Cryptography
-aes-gcm = "0.10"
+# Randomness
+rand = { workspace = true }
