@@ -78,7 +78,14 @@ pub enum GhostCommand {
     },
 
     /// Rotate the active signing key (KERI Rotation Event).
-    RotateKey,
+    ///
+    /// The mnemonic is read on the CLI side (from `TSC_MNEMONIC` or prompt)
+    /// and passed to the daemon only for the duration of this call.
+    /// The daemon never stores the mnemonic.
+    RotateKey {
+        /// The BIP-39 mnemonic phrase authorizing this rotation.
+        mnemonic: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────

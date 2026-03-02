@@ -91,18 +91,37 @@ pub fn derive_prerotation_key(master_seed: &[u8]) -> Result<SigningKey, CryptoEr
 /// The K2 scalar (in `Zeroizing<[u8; 32]>`) is zeroed as soon as the hash
 /// is computed; the `SigningKey` object is dropped immediately after.
 pub fn prerotation_commitment(master_seed: &[u8]) -> Result<[u8; 32], CryptoError> {
-    // scalar is zeroed when the block ends
+    commitment_at_index(master_seed, 1)
+}
+
+/// Derives the signing key at SLIP-0010 path `m/44'/7777'/0'/0'/<index>'`.
+///
+/// Used by [`Persona::rotate`] to derive successive active keys.
+/// Index 0 = initial active key (K1); index N = active key after N rotations.
+pub fn derive_key_at_index(master_seed: &[u8], index: u32) -> Result<SigningKey, CryptoError> {
     let scalar = slip10_derive(master_seed, &[
         44            | HARDENED,
         TSC_COIN_TYPE | HARDENED,
         0             | HARDENED,
         0             | HARDENED,
-        1             | HARDENED,
+        index         | HARDENED,
     ])?;
-    let k2 = SigningKey::from_bytes(&scalar);
-    // scalar is dropped (and zeroed) here; k2's pubkey bytes are on the stack
-    let pubkey_bytes = k2.verifying_key().to_bytes();
-    // k2 is dropped (and zeroed via its own Drop impl) here
+    Ok(SigningKey::from_bytes(&scalar))
+}
+
+/// Computes `BLAKE3(K.verifying_key_bytes)` for the key at `index`.
+///
+/// Used by [`Persona::rotate`] to compute the next pre-rotation commitment.
+pub fn commitment_at_index(master_seed: &[u8], index: u32) -> Result<[u8; 32], CryptoError> {
+    let scalar = slip10_derive(master_seed, &[
+        44            | HARDENED,
+        TSC_COIN_TYPE | HARDENED,
+        0             | HARDENED,
+        0             | HARDENED,
+        index         | HARDENED,
+    ])?;
+    let k = SigningKey::from_bytes(&scalar);
+    let pubkey_bytes = k.verifying_key().to_bytes();
     Ok(*blake3::hash(&pubkey_bytes).as_bytes())
 }
 

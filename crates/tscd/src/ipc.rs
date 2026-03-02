@@ -1,41 +1,105 @@
 //! IPC server over Unix Domain Sockets (RFC-003).
 //!
-//! Authentication: `SO_PEERCRED` — caller UID must match the daemon owner or be root.
-//! Framing: u32 little-endian length prefix (from `tsc_proto::read_framed` / `write_framed`).
-//! Types: `GhostCommand` / `GhostResponse` from `tsc-proto` (RFC-011, ADR-007).
+//! ## Framing
+//! Every message is prefixed with a 4-byte little-endian length (tsc-proto).
+//!
+//! ## Authentication
+//! `SO_PEERCRED` — caller UID must match daemon owner or be root.
+//!
+//! ## Live identity reload
+//! `InitIdentity` and `RecoverIdentity` write a new vault and then update
+//! the shared [`DaemonState`] so subsequent `status` calls reflect the new
+//! identity without restarting the daemon.
 
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::UnixListener;
+use std::time::Instant;
+
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::Uid;
 use std::os::unix::io::AsFd;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UnixListener;
+use tokio::sync::RwLock;
 
 use tsc_net::dht::GhostDiscovery;
-use tsc_net::NetStack;
+use tsc_net::{NetStack, ReannounceRequest};
 use tsc_proto::{
     read_framed, write_framed, DaemonStatus, GhostCommand, GhostResponse, VaultState,
 };
 
-/// The IPC server that handles CLI → daemon commands.
+// ── Shared daemon state ────────────────────────────────────────────────────
+
+/// What the daemon knows about the vault at boot time.
+pub enum BootVaultState {
+    /// Vault was unlocked; contains the 32-byte key material.
+    Unlocked([u8; 32]),
+    /// No vault file existed or mnemonic was not supplied.
+    Ephemeral,
+}
+
+/// Mutable identity state, shared between the IPC handler tasks.
+///
+/// Wrapped in `Arc<RwLock<_>>` so `InitIdentity` can update it while
+/// concurrent `status` reads continue without blocking.
+pub struct IdentityState {
+    /// Current GhostID string (persistent or `"ephemeral:<short>"`).
+    pub ghost_id: String,
+    /// Whether a valid vault is loaded.
+    pub vault_ok: bool,
+}
+
+/// All state the IPC server needs, shared via `Arc`.
+pub struct DaemonState {
+    /// Mutable identity (GhostID, vault status).
+    pub identity: RwLock<IdentityState>,
+    /// Absolute path of the vault file.
+    pub vault_path: PathBuf,
+    /// Hardware UUID used for vault KDF binding.
+    pub hw_uuid: String,
+    /// Wall-clock start time for uptime calculation.
+    pub started: Instant,
+}
+
+impl DaemonState {
+    /// Constructs the initial shared state.
+    pub fn new(
+        ghost_id:    String,
+        vault_state: BootVaultState,
+        vault_path:  PathBuf,
+        hw_uuid:     String,
+    ) -> Self {
+        let vault_ok = matches!(vault_state, BootVaultState::Unlocked(_));
+        Self {
+            identity: RwLock::new(IdentityState { ghost_id, vault_ok }),
+            vault_path,
+            hw_uuid,
+            started: Instant::now(),
+        }
+    }
+}
+
+// ── IPC server ─────────────────────────────────────────────────────────────
+
+/// Listens on a Unix Domain Socket and dispatches `GhostCommand`s.
 pub struct IpcServer {
-    /// Filesystem path for the Unix Domain Socket.
+    /// Path of the Unix Domain Socket to bind.
     pub socket_path: String,
-    /// The resolved Persona (None in ephemeral mode).
-    pub persona: Option<tsc_crypto::Persona>,
+    /// Shared daemon state (identity, vault path, hw_uuid).
+    pub state: Arc<DaemonState>,
+    /// Network stack — needed so InitIdentity can update local_id and reannounce.
+    pub net_stack: Arc<NetStack>,
 }
 
 impl IpcServer {
-    /// Starts the IPC listener loop.
+    /// Runs the accept loop.
     pub async fn start(
         self,
-        net: Arc<NetStack>,
         discovery: Arc<GhostDiscovery>,
     ) -> tokio::io::Result<()> {
-        // Clean up stale socket from a previous run
         let _ = std::fs::remove_file(&self.socket_path);
         let listener = UnixListener::bind(&self.socket_path)?;
 
-        // Tighten socket permissions to owner-only
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -47,158 +111,212 @@ impl IpcServer {
 
         println!("[*] IPC: Listening on {}", self.socket_path);
 
-        let start_time = std::time::Instant::now();
-        // The ghost_id for status responses
-        let ghost_id = self
-            .persona
-            .as_ref()
-            .map(|p| p.ghost_id.clone())
-            .unwrap_or_else(|| "ephemeral".to_string());
-
         loop {
             let (stream, _) = listener.accept().await?;
 
-            // ── Peer credential check (RFC-003 §3.1) ──────────────────────
+            // Peer credential check
             if let Ok(creds) = getsockopt(&stream.as_fd(), PeerCredentials) {
-                let caller_uid = Uid::from_raw(creds.uid());
-                if caller_uid != Uid::current() && !caller_uid.is_root() {
-                    eprintln!("[!] IPC: Rejected connection from UID {}", creds.uid());
+                let uid = Uid::from_raw(creds.uid());
+                if uid != Uid::current() && !uid.is_root() {
+                    eprintln!("[!] IPC: Rejected UID {}", creds.uid());
                     continue;
                 }
             }
 
-            let net_stack   = Arc::clone(&net);
-            let disc_stack  = Arc::clone(&discovery);
-            let ghost_id_c  = ghost_id.clone();
-            let uptime_fn   = start_time;
+            let disc_c  = Arc::clone(&discovery);
+            let state_c = Arc::clone(&self.state);
+            let ns_c    = Arc::clone(&self.net_stack);
 
             tokio::spawn(async move {
-                handle_connection(stream, net_stack, disc_stack, ghost_id_c, uptime_fn).await;
+                handle_connection(stream, disc_c, state_c, ns_c).await;
             });
         }
     }
 }
 
-/// Handles a single accepted IPC connection.
+// ── Connection handler ─────────────────────────────────────────────────────
+
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
-    net: Arc<NetStack>,
-    discovery: Arc<GhostDiscovery>,
-    ghost_id: String,
-    started: std::time::Instant,
+    discovery:  Arc<GhostDiscovery>,
+    state:      Arc<DaemonState>,
+    net_stack:  Arc<NetStack>,
 ) {
-    use tokio::io::AsyncWriteExt;
-
-    // Split into reader/writer so we can hold them simultaneously
     let (mut reader, mut writer) = stream.split();
 
     let cmd = match read_framed::<_, GhostCommand>(&mut reader).await {
         Ok(Some(c)) => c,
-        Ok(None) => return, // clean EOF
+        Ok(None)    => return,
         Err(e) => {
-            eprintln!("[!] IPC: Frame read error: {}", e);
+            eprintln!("[!] IPC: frame read error: {}", e);
             return;
         }
     };
 
-    let response = dispatch_command(cmd, &net, &discovery, &ghost_id, started).await;
+    let response = dispatch(cmd, &discovery, &state, &net_stack).await;
 
     if let Err(e) = write_framed(&mut writer, &response).await {
-        eprintln!("[!] IPC: Frame write error: {}", e);
+        eprintln!("[!] IPC: frame write error: {}", e);
     }
     let _ = writer.shutdown().await;
 }
 
-/// Routes a `GhostCommand` to the appropriate handler and returns a `GhostResponse`.
-async fn dispatch_command(
-    cmd: GhostCommand,
-    net: &Arc<NetStack>,
+// ── Command dispatch ───────────────────────────────────────────────────────
+
+async fn dispatch(
+    cmd:       GhostCommand,
     discovery: &Arc<GhostDiscovery>,
-    ghost_id: &str,
-    started: std::time::Instant,
+    state:     &Arc<DaemonState>,
+    net_stack: &Arc<NetStack>,
 ) -> GhostResponse {
     match cmd {
-        // ── Ping ───────────────────────────────────────────────────────────
+
+        // ── Ping ─────────────────────────────────────────────────────────
         GhostCommand::Ping => GhostResponse::Ok("TSC_PULSE_OK".into()),
 
-        // ── Status ─────────────────────────────────────────────────────────
+        // ── Status ───────────────────────────────────────────────────────
         GhostCommand::Status => {
+            let id    = state.identity.read().await;
+            let vault = if id.ghost_id.starts_with("ephemeral") {
+                VaultState::Ephemeral
+            } else if id.vault_ok {
+                VaultState::Unlocked
+            } else {
+                VaultState::Locked
+            };
             GhostResponse::Status(DaemonStatus {
-                ghost_id: ghost_id.to_string(),
-                vault_state: if ghost_id.starts_with("ephemeral") {
-                    VaultState::Ephemeral
-                } else {
-                    VaultState::Unlocked
-                },
-                peer_count: 0,    // TODO: query libp2p swarm peer count
-                active_ghosts: 0, // TODO: query runtime Ghost registry
-                uptime_secs: started.elapsed().as_secs(),
+                ghost_id:     id.ghost_id.clone(),
+                vault_state:  vault,
+                peer_count:   0,    // TODO(Phase 2.2): wire to libp2p swarm peer count
+                active_ghosts: 0,   // TODO(Phase 3.1): wire to GhostHandle registry
+                uptime_secs:  state.started.elapsed().as_secs(),
             })
         }
 
-        // ── Init Identity ──────────────────────────────────────────────────
+        // ── Init Identity ────────────────────────────────────────────────
         GhostCommand::InitIdentity => {
-            let hw_uuid = tsc_crypto::vault::get_hardware_uuid();
-            let vault_path = match tsc_crypto::vault::vault_path() {
-                Ok(p) => p,
-                Err(e) => return GhostResponse::Err(format!("{}", e)),
-            };
+            let hw_uuid = &state.hw_uuid;
 
-            // Generate entropy and derive seed
+            // 1. Generate fresh entropy and derive persona
             let (phrase, master_seed) = tsc_crypto::bip39::generate_sovereign_entropy();
-            let words: Vec<String> = phrase.split_whitespace().map(|s| s.to_string()).collect();
+            let words: Vec<String> = phrase.split_whitespace()
+                .map(|s| s.to_string()).collect();
 
-            // Derive persona to get K1 for the vault KDF
             let persona = match tsc_crypto::Persona::from_seed(&master_seed) {
-                Ok(p) => p,
-                Err(e) => return GhostResponse::Err(format!("{}", e)),
+                Ok(p)  => p,
+                Err(e) => return GhostResponse::Err(e.to_string()),
             };
-
             let k1 = match tsc_crypto::bip39::derive_active_key(&master_seed) {
-                Ok(k) => k,
-                Err(e) => return GhostResponse::Err(format!("{}", e)),
+                Ok(k)  => k,
+                Err(e) => return GhostResponse::Err(e.to_string()),
             };
-            let key_material = k1.to_bytes();
 
-            // Lock vault
-            if let Err(e) = tsc_crypto::vault::lock_vault(&words, &key_material, &hw_uuid, &vault_path) {
-                return GhostResponse::Err(format!("{}", e));
+            // 2. Write vault
+            if let Err(e) = tsc_crypto::vault::lock_vault(
+                &words, &k1.to_bytes(), hw_uuid, &state.vault_path,
+            ) {
+                return GhostResponse::Err(e.to_string());
             }
 
-            println!("[+] IPC: New Identity Created: {}", persona.ghost_id);
+            // 2b. Persist the inception IEL (overwrites any previous IEL)
+            if let Err(e) = tsc_crypto::iel::save_iel(&persona.event_log) {
+                // Non-fatal: log the error but continue — rotate-key will
+                // reconstruct from seed if the IEL is missing.
+                eprintln!("[WARN] IEL write failed after init: {}", e);
+            }
+
+            // 3. Update live daemon state and DHT identity
+            {
+                let mut id = state.identity.write().await;
+                id.ghost_id = persona.ghost_id.clone();
+                id.vault_ok = true;
+            }
+            // Update the NetStack's local_id and local_ixn for HELLO handshake
+            *net_stack.local_id.write().await  = persona.ghost_id.clone();
+            *net_stack.local_ixn.write().await = Some(
+                match &persona.event_log[0] {
+                    tsc_crypto::keri::KeyEvent::Inception(ixn) => ixn.clone(),
+                    _ => unreachable!(),
+                }
+            );
+            // Encode the local address and store in the local Kademlia store immediately
+            if let Ok(addr) = net_stack.endpoint.local_addr() {
+                let real_addr = if addr.ip().is_unspecified() {
+                    std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), addr.port())
+                } else { addr };
+                let value = discovery.encode_coordinate(real_addr);
+                let _ = net_stack.reannounce_tx().send(ReannounceRequest {
+                    ghost_id: persona.ghost_id.clone(),
+                    value,
+                }).await;
+            }
+
+            println!("[+] IPC: Identity created: {}", persona.ghost_id);
             GhostResponse::Mnemonic(words)
         }
 
-        // ── Recover Identity ───────────────────────────────────────────────
+        // ── Recover Identity ─────────────────────────────────────────────
         GhostCommand::RecoverIdentity { mnemonic } => {
-            let hw_uuid = tsc_crypto::vault::get_hardware_uuid();
-            let vault_path = match tsc_crypto::vault::vault_path() {
-                Ok(p) => p,
-                Err(e) => return GhostResponse::Err(format!("{}", e)),
-            };
+            let hw_uuid = &state.hw_uuid;
 
             let master_seed = match tsc_crypto::bip39::restore_from_phrase(&mnemonic) {
-                Ok(s) => s,
-                Err(e) => return GhostResponse::Err(format!("{}", e)),
+                Ok(s)  => s,
+                Err(e) => return GhostResponse::Err(e.to_string()),
             };
-
-            let words: Vec<String> = mnemonic.split_whitespace().map(|s| s.to_string()).collect();
             let k1 = match tsc_crypto::bip39::derive_active_key(&master_seed) {
-                Ok(k) => k,
-                Err(e) => return GhostResponse::Err(format!("{}", e)),
+                Ok(k)  => k,
+                Err(e) => return GhostResponse::Err(e.to_string()),
             };
+            let words: Vec<String> = mnemonic.split_whitespace()
+                .map(|s| s.to_string()).collect();
 
-            if let Err(e) = tsc_crypto::vault::lock_vault(&words, &k1.to_bytes(), &hw_uuid, &vault_path) {
-                return GhostResponse::Err(format!("{}", e));
+            if let Err(e) = tsc_crypto::vault::lock_vault(
+                &words, &k1.to_bytes(), hw_uuid, &state.vault_path,
+            ) {
+                return GhostResponse::Err(e.to_string());
             }
-            GhostResponse::Ok("IDENTITY:RECOVERED: Vault written. Restart tscd to load the new identity.".into())
+
+            // Update live state and DHT identity
+            if let Ok(persona) = tsc_crypto::Persona::from_seed(&master_seed) {
+                // Persist fresh inception IEL (discards any prior rotation history —
+                // recovery intentionally resets to rotation 0)
+                if let Err(e) = tsc_crypto::iel::save_iel(&persona.event_log) {
+                    eprintln!("[WARN] IEL write failed after recover: {}", e);
+                }
+                {
+                    let mut id = state.identity.write().await;
+                    id.ghost_id = persona.ghost_id.clone();
+                    id.vault_ok = true;
+                }
+                *net_stack.local_id.write().await  = persona.ghost_id.clone();
+                *net_stack.local_ixn.write().await = Some(
+                    match &persona.event_log[0] {
+                        tsc_crypto::keri::KeyEvent::Inception(ixn) => ixn.clone(),
+                        _ => unreachable!(),
+                    }
+                );
+                if let Ok(addr) = net_stack.endpoint.local_addr() {
+                    let real_addr = if addr.ip().is_unspecified() {
+                        std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), addr.port())
+                    } else { addr };
+                    let value = discovery.encode_coordinate(real_addr);
+                    let _ = net_stack.reannounce_tx().send(ReannounceRequest {
+                        ghost_id: persona.ghost_id.clone(),
+                        value,
+                    }).await;
+                }
+            }
+
+            GhostResponse::Ok(
+                "IDENTITY:RECOVERED: Vault written and identity reloaded.".into(),
+            )
         }
 
-        // ── Resolve ────────────────────────────────────────────────────────
-        GhostCommand::Resolve { ghost_id: target_id } => {
-            match net.resolve_ghost(target_id.clone(), discovery).await {
+        // ── Resolve ──────────────────────────────────────────────────────
+        GhostCommand::Resolve { ghost_id } => {
+            match net_stack.resolve_ghost(ghost_id.clone(), discovery).await {
                 Some(addr) => GhostResponse::Resolved {
-                    ghost_id: target_id,
+                    ghost_id,
                     addr: addr.to_string(),
                 },
                 None => GhostResponse::Err(
@@ -207,66 +325,171 @@ async fn dispatch_command(
             }
         }
 
-        // ── Connect ────────────────────────────────────────────────────────
-        GhostCommand::Connect { ghost_id: target_id } => {
-            match net.resolve_ghost(target_id.clone(), discovery).await {
+        // ── Connect ──────────────────────────────────────────────────────
+        GhostCommand::Connect { ghost_id } => {
+            match net_stack.resolve_ghost(ghost_id.clone(), discovery).await {
                 Some(addr) => GhostResponse::LinkEstablished {
-                    remote_id: target_id,
-                    addr: addr.to_string(),
+                    remote_id: ghost_id,
+                    addr:      addr.to_string(),
                 },
                 None => GhostResponse::Err(
-                    "NET:NOT_FOUND: GhostID not found in DHT or offline".into(),
+                    "NET:NOT_FOUND: GhostID not found or offline".into(),
                 ),
             }
         }
 
-        // ── SendMessage ────────────────────────────────────────────────────
+        // ── Send Message ─────────────────────────────────────────────────
         GhostCommand::SendMessage { target_id, content } => {
-
-            let addr = match net.resolve_ghost(target_id.clone(), discovery).await {
+            let addr = match net_stack.resolve_ghost(target_id.clone(), discovery).await {
                 Some(a) => a,
-                None => {
-                    return GhostResponse::Err(
-                        "NET:NOT_FOUND: Target Ghost offline or unreachable".into(),
-                    )
-                }
+                None    => return GhostResponse::Err(
+                    "NET:NOT_FOUND: Target Ghost offline or unreachable".into(),
+                ),
             };
-
-            match net.connect(addr).await {
+            match net_stack.connect(addr).await {
                 Ok(conn) => match conn.open_ghost_stream().await {
                     Ok(mut send) => {
-                        let _ = send.write_all(content.as_bytes()).await;
+                        // Wrap content in a Data frame for protocol-aware ingress
+                        let frame = tsc_net::gsp::GspFrame::new(
+                            tsc_net::gsp::MsgType::Data,
+                            content.into_bytes(),
+                        );
+                        let _ = send.write_all(&frame.to_bytes()).await;
                         let _ = send.finish().await;
                         GhostResponse::MessageSent { target_id }
                     }
                     Err(e) => GhostResponse::Err(
-                        format!("NET:STREAM_OPEN: Failed to open data stream: {}", e),
+                        format!("NET:STREAM: {}", e),
                     ),
                 },
                 Err(e) => GhostResponse::Err(
-                    format!("NET:CONNECT: GSP handshake failed: {}", e),
+                    format!("NET:CONNECT: {}", e),
                 ),
             }
         }
 
-        // ── Ghost lifecycle (Phase 3) ──────────────────────────────────────
-        GhostCommand::SpawnGhost { image_hash, vault_id: _ } => {
-            GhostResponse::Err(format!(
-                "RUNTIME:NOT_IMPL: SpawnGhost({}) — Phase 3 work pending",
-                image_hash
-            ))
-        }
-        GhostCommand::ListGhosts => {
-            GhostResponse::GhostList(vec![])
-        }
-        GhostCommand::StopGhost { ghost_id } => {
-            GhostResponse::Err(format!(
-                "RUNTIME:NOT_IMPL: StopGhost({}) — Phase 3 work pending",
-                ghost_id
-            ))
-        }
-        GhostCommand::RotateKey => {
-            GhostResponse::Err("IDENTITY:NOT_IMPL: RotateKey — Phase 1.1 work pending".into())
+        // ── Ghost lifecycle (Phase 3 — stubs) ────────────────────────────
+        GhostCommand::SpawnGhost { image_hash, .. } => GhostResponse::Err(
+            format!("RUNTIME:NOT_IMPL: SpawnGhost({}) — Phase 3 pending", image_hash),
+        ),
+        GhostCommand::ListGhosts => GhostResponse::GhostList(vec![]),
+        GhostCommand::StopGhost { ghost_id } => GhostResponse::Err(
+            format!("RUNTIME:NOT_IMPL: StopGhost({}) — Phase 3 pending", ghost_id),
+        ),
+        GhostCommand::RotateKey { mnemonic } => {
+            // mnemonic arrived from tsc-cli (read from TSC_MNEMONIC on client side).
+            // Validate and derive seed immediately; mnemonic is dropped at end of scope.
+            let master_seed = match tsc_crypto::bip39::restore_from_phrase(mnemonic.trim()) {
+                Ok(s)  => s,
+                Err(e) => return GhostResponse::Err(format!("IDENTITY:ROTATE: {}", e)),
+            };
+
+            // 2. Load the existing IEL or build from vault
+            let mut log = match tsc_crypto::iel::load_iel() {
+                Ok(l) if !l.is_empty() => l,
+                _ => {
+                    // IEL file missing — reconstruct from seed (inception only)
+                    match tsc_crypto::Persona::from_seed(&master_seed) {
+                        Ok(p) => p.event_log.clone(),
+                        Err(e) => return GhostResponse::Err(format!("IDENTITY:ROTATE: {}", e)),
+                    }
+                }
+            };
+
+            // 3. Determine current rotation count from IEL length
+            let rotation = (log.len() as u32).saturating_sub(1);
+            let next_rotation = rotation + 1;
+
+            // 4. Derive new active key (K_{N+1}) and commitment BLAKE3(K_{N+2})
+            let new_active = match tsc_crypto::bip39::derive_key_at_index(&master_seed, next_rotation) {
+                Ok(k)  => k,
+                Err(e) => return GhostResponse::Err(format!("IDENTITY:ROTATE: {}", e)),
+            };
+            let new_commitment = match tsc_crypto::bip39::commitment_at_index(&master_seed, next_rotation + 1) {
+                Ok(c)  => c,
+                Err(e) => return GhostResponse::Err(format!("IDENTITY:ROTATE: {}", e)),
+            };
+
+            // 5. Get prev_digest and ghost_id from tip of IEL
+            let prev_event = match log.last() {
+                Some(e) => e,
+                None    => return GhostResponse::Err("IDENTITY:ROTATE: IEL is empty".into()),
+            };
+            let prev_digest = match prev_event.digest() {
+                Ok(d)  => d,
+                Err(e) => return GhostResponse::Err(format!("IDENTITY:ROTATE: {}", e)),
+            };
+            let seq = prev_event.seq() + 1;
+
+            // ghost_id is always the inception GhostID
+            let ghost_id = state.identity.read().await.ghost_id.clone();
+            // If still ephemeral, can't rotate
+            if ghost_id.starts_with("ephemeral") {
+                return GhostResponse::Err(
+                    "IDENTITY:ROTATE: Cannot rotate an ephemeral identity. Run 'init' first.".into(),
+                );
+            }
+
+            // We need the current active key to sign sig_prev.
+            // Re-derive it from the seed at the current rotation index.
+            let current_active = match tsc_crypto::bip39::derive_key_at_index(&master_seed, rotation) {
+                Ok(k)  => k,
+                Err(e) => return GhostResponse::Err(format!("IDENTITY:ROTATE: {}", e)),
+            };
+
+            let deriv_path = format!("m/44'/7777'/0'/0/{}'", next_rotation);
+            let rot_event = match tsc_crypto::keri::RotationEvent::new(
+                &current_active,
+                &new_active,
+                new_commitment,
+                prev_digest,
+                seq,
+                &ghost_id,
+                &deriv_path,
+            ) {
+                Ok(r)  => r,
+                Err(e) => return GhostResponse::Err(format!("IDENTITY:ROTATE: {}", e)),
+            };
+
+            // 6. Append to IEL in memory and persist
+            let new_event = tsc_crypto::keri::KeyEvent::Rotation(rot_event);
+            log.push(new_event.clone());
+
+            if let Err(e) = tsc_crypto::iel::append_event(&new_event) {
+                return GhostResponse::Err(format!("IDENTITY:ROTATE: IEL write failed: {}", e));
+            }
+
+            // 7. Update vault key_material with new K_{N+1} bytes
+            let words: Vec<String> = mnemonic.trim().split_whitespace()
+                .map(|s| s.to_string()).collect();
+            if let Err(e) = tsc_crypto::vault::lock_vault(
+                &words,
+                &new_active.to_bytes(),
+                &state.hw_uuid,
+                &state.vault_path,
+            ) {
+                return GhostResponse::Err(format!("IDENTITY:ROTATE: vault rewrite failed: {}", e));
+            }
+
+            // 8. Update NetStack local_id and reannounce (GhostID unchanged)
+            // The GhostID is stable — no need to update net_stack.local_id.
+            // But we do reannounce to refresh the DHT record.
+            if let Ok(addr) = net_stack.endpoint.local_addr() {
+                let real_addr = if addr.ip().is_unspecified() {
+                    std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), addr.port())
+                } else { addr };
+                let value = discovery.encode_coordinate(real_addr);
+                let _ = net_stack.reannounce_tx().send(tsc_net::ReannounceRequest {
+                    ghost_id: ghost_id.clone(),
+                    value,
+                }).await;
+            }
+
+            println!("[+] IPC: Key rotated. Rotation #{}, GhostID unchanged: {}", next_rotation, &ghost_id[..16]);
+            let new_pubkey_hex = hex::encode(new_active.verifying_key().to_bytes());
+            GhostResponse::KeyRotated {
+                new_public_key: new_pubkey_hex,
+            }
         }
     }
 }

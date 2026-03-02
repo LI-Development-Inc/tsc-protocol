@@ -7,7 +7,7 @@ description = "The Shell — TSC privileged daemon"
 [dependencies]
 # TSC crates
 tsc-crypto  = { path = "../tsc-crypto" }
-tsc-net     = { path = "../tsc-net" }
+tsc-net     = { path = "../tsc-net", features = ["dev"] }
 tsc-runtime = { path = "../tsc-runtime" }
 tsc-proto   = { path = "../tsc-proto" }
 

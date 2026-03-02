@@ -1,63 +1,94 @@
 # 📂 TSC Project File Structure
 
 ```text
-standalone-complex/
-├── Cargo.toml                # Workspace configuration
-├── README.md                 # Project overview & setup
-├── .gitignore                # Rust/OCI build artifacts
-├── crates/
-│   ├── tsc-crypto/           # THE IDENTITY DOMAIN (Root of Trust)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── bip39.rs      # Entropy & Seed generation
-│   │       ├── keri.rs       # Succession logs & Key rotation
-│   │       └── vault.rs      # Argon2id & Key-wrap logic
-│   ├── tsc-net/              # THE TRANSPORT DOMAIN (The Pipe)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── gsp.rs        # GSP over QUIC framing
-│   │       ├── dht.rs        # Kademlia & Encrypted Discovery
-│   │       └── morph.rs      # Chaffing/Traffic morphing logic
-│   ├── tsc-runtime/          # THE EXECUTION DOMAIN (The Ghost)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── jail.rs       # Namespace/Cgroup orchestration
-│   │       ├── oci.rs        # Integration with youki/crun
-│   │       └── bridge.rs     # SOCKS5/Legacy protocol proxy
-│   └── tscd/                 # THE SHELL (Local Daemon)
-│   |   ├── Cargo.toml
-│   |   └── src/
-│   |       ├── main.rs       # Entry point & Orchestrator
-│   |       └── ipc.rs        # Unix Domain Socket (SO_PEERCRED)
-|   ├── tsc-cli/          # THE EXECUTION DOMAIN (The Ghost)
-|   │   │   ├── Cargo.toml
-|   │   │   └── src/
-|   │   │       ├── main.rs
-|   │   │       ├── main.rs       # Namespace/Cgroup orchestration
-|   │   │       ├── oci.rs        # Integration with youki/crun
-|   │   │       └── bridge.rs     # SOCKS5/Legacy protocol proxy
-|
-|
+tsc-work/
+├── Cargo.toml                  # Workspace — all crate versions & shared deps
+├── Makefile                    # Manual test runner (make help for full list)
+├── .env.test.example           # Environment variable template for testing
+├── docs/
+│   ├── ROADMAP.md              # Phase-by-phase implementation status
+│   ├── RFCs.md                 # Protocol RFCs 001–008
+│   ├── DesignDocs.md           # Architecture, design, requirements, crypto spec
+│   └── filestructure.md        # This file
 ├── scripts/
-│   └── setup-bridge.sh       # Linux virtual tap configuration
-└── docker/                   # OCI Ghost templates
-    └── base-ghost.Dockerfile
-
+│   ├── testing-clear-data.sh   # Legacy wipe script (superseded by make clean-state)
+│   └── vps-setup.sh            # VPS peer bootstrap (Phase 2.2)
+└── crates/
+    │
+    ├── tsc-crypto/             # THE IDENTITY DOMAIN (Root of Trust)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs          # Persona struct, rotate(), from_seed()
+    │       ├── bip39.rs        # BIP-39 entropy, SLIP-0010 key derivation
+    │       ├── keri.rs         # KERI event types, verify_event_log()
+    │       ├── iel.rs          # Identity Event Log: append-only JSONL persistence
+    │       └── vault.rs        # Argon2id + ChaCha20-Poly1305 vault
+    │
+    ├── tsc-net/                # THE TRANSPORT DOMAIN (The Pipe)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs          # NetStack, QUIC endpoint, listen(), connect()
+    │       ├── gsp.rs          # GSP wire format: GspHello, GspFrame, verify_hello()
+    │       ├── dht.rs          # GhostDiscovery: CoordinateBlob, encode/decode
+    │       └── morph.rs        # Chaff injection (scaffolded — Phase 2.3)
+    │
+    ├── tsc-proto/              # SHARED IPC CONTRACT
+    │   ├── Cargo.toml
+    │   └── src/
+    │       └── lib.rs          # GhostCommand, GhostResponse, framing (RFC-003)
+    │
+    ├── tsc-runtime/            # THE EXECUTION DOMAIN (The Ghost) — Phase 3
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs          # GhostState, GhostStatus types
+    │       ├── jail.rs         # GhostJail: OCI spawn stub (Phase 3.1)
+    │       ├── oci.rs          # GhostBundle, GhostFetcher: OCI config stubs (Phase 3.2)
+    │       └── bridge.rs       # GhostBridge: TCP→GSP proxy stub (Phase 3.3)
+    │
+    ├── tscd/                   # THE SHELL (Privileged Daemon)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── main.rs         # Boot sequence, task spawning, identity loading
+    │       └── ipc.rs          # IPC command dispatch (SO_PEERCRED auth)
+    │
+    └── tsc-cli/                # THE CONTROLLER (User-facing CLI)
+        ├── Cargo.toml
+        └── src/
+            └── main.rs         # Command parsing, response rendering
 ```
 
 ---
 
-### 🛠️ Required Build & Configuration Files
+## Crate Dependency Graph
 
-Beyond the source code, the following files are mandatory to satisfy our **Engineering Guardrails**:
+```
+tsc-cli ──────────────────────────────► tsc-proto
+tscd ──────────► tsc-net ──────────────► tsc-proto
+      └──────────► tsc-crypto             │
+      └──────────► tsc-runtime            │
+                   └──────────► tsc-net   │
+tsc-net ──────────────────────────────► tsc-crypto
+tsc-proto ── (no internal deps, bincode/serde only)
+```
 
-| File | Purpose | Requirement Satisfied |
-| --- | --- | --- |
-| **`rust-toolchain.toml`** | Pins Rust version to $\ge 1.75$. | Ensures `io_uring` and `async` stability. |
-| **`.cargo/config.toml`** | Sets `-D warnings` and `forbid(unsafe_code)`. | Enforces strict safety invariants. |
-| **`policy.json`** | Defines OCI runtime security profiles. | Configures `NEWNET` and `NEWUSER` isolation. |
-| **`lsh-config.toml`** | Default configuration for "Lighthouse" nodes. | Enables signaling and NAT traversal. |
-| **`update-keys.json`** | Threshold signature public keys. | Facilitates Sovereign Binary Updates. |
+---
+
+## Key Data Paths (XDG)
+
+| Data | Location |
+|------|----------|
+| Vault | `$XDG_DATA_HOME/tsc/vault.bin` (default: `~/.local/share/tsc/vault.bin`) |
+| IEL | `$XDG_DATA_HOME/tsc/iel.jsonl` |
+| IPC socket | `$XDG_RUNTIME_DIR/tsc/tscd.sock` (default: `/run/user/<uid>/tsc/tscd.sock`) |
+| Config *(Phase 4)* | `$XDG_CONFIG_HOME/tsc/config.toml` |
+| Daemon log *(dev)* | `/tmp/tscd-test.log` (make daemon-start) |
+
+---
+
+## Required Files *(not yet created)*
+
+| File | Purpose |
+|------|---------|
+| `rust-toolchain.toml` | Pin Rust ≥ 1.75 |
+| `.cargo/config.toml` | `-D warnings` enforced workspace-wide |
+| `$XDG_CONFIG_HOME/tsc/config.toml` | Bootstrap nodes, chaff rate, log level (Phase 4.1) |

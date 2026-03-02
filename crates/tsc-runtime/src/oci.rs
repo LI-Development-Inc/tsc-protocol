@@ -1,14 +1,22 @@
 //! OCI Bundle management and P2P image distribution.
-//! This module defines the `GhostBundle` struct, which represents the OCI bundle configuration for a Ghost-Box. 
-//! It includes methods for preparing the runtime directory using tmpfs and ensuring that the filesystem is volatile. 
-//! Additionally, the `GhostFetcher` struct provides functionality to pull OCI layers directly from peers in a BitTorrent-style manner using GSP, 
-//! verifying layer integrity against BLAKE3 hashes.
+//!
+//! This module manages OCI bundle configuration and peer-to-peer image fetching.
+//!
+//! # Phase 3.2 Implementation Checklist
+//!
+//! - [ ] `GhostBundle::prepare_runtime_dir`: set up overlayfs (read-only base + tmpfs upper)
+//! - [ ] `GhostBundle::write_config`: generate OCI `config.json` with TSC namespace spec
+//! - [ ] `GhostFetcher::pull_from_swarm`: query DHT for image providers, pull via GSP
+//! - [ ] BLAKE3 integrity check on each pulled layer
+//! - [ ] Mount vault ref as read-only bind mount at `/vault` inside bundle
+//!
+//! See: RFC-004 §4.2, ROADMAP.md Phase 3.2
 
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-/// Represents an OCI Bundle for a Ghost.
+/// An OCI Bundle ready to pass to the runtime (youki/crun).
 pub struct GhostBundle {
     /// Host path to the bundle directory.
     pub bundle_path: PathBuf,
@@ -16,7 +24,7 @@ pub struct GhostBundle {
     pub config: GhostConfig,
 }
 
-/// OCI config.json structure tailored for TSC.
+/// OCI `config.json` structure for TSC Ghost-Boxes.
 #[derive(Serialize, Deserialize)]
 pub struct GhostConfig {
     /// OCI specification version.
@@ -30,45 +38,52 @@ pub struct GhostConfig {
 /// Root filesystem specification.
 #[derive(Serialize, Deserialize)]
 pub struct Root {
-    /// Path to the rootfs.
+    /// Path to the rootfs (relative to bundle_path).
     pub path: String,
-    /// Whether the filesystem is read-only.
+    /// Whether the root filesystem is read-only.
     pub readonly: bool,
 }
 
-/// Linux namespace and constraint settings.
+/// Linux namespace and resource constraint settings.
 #[derive(Serialize, Deserialize)]
 pub struct LinuxConstraints {
-    /// Active namespaces for this bundle.
+    /// Active namespace types for this bundle.
     pub namespaces: Vec<Namespace>,
 }
 
-/// A specific Linux namespace type.
+/// A Linux namespace entry in the OCI config.
 #[derive(Serialize, Deserialize)]
 pub struct Namespace {
-    /// The type (e.g., "network", "pid", "mount").
+    /// Namespace type string as per OCI spec ("network", "pid", "mount", "user", etc.)
     pub r#type: String,
 }
 
 impl GhostBundle {
-    /// Prepares the filesystem for a new Ghost using volatile storage.
+    /// Creates the bundle directory.
+    ///
+    /// **Phase 3.2 stub** — will set up overlayfs and generate `config.json`.
     pub fn prepare_runtime_dir(&self) -> std::io::Result<()> {
         fs::create_dir_all(&self.bundle_path)?;
+        // TODO(Phase 3.2): mount overlayfs: ro base layer + tmpfs upper
+        // TODO(Phase 3.2): write config.json via serde_json
         Ok(())
     }
 }
 
-
-/// Logic for fetching Ghost images directly from peers via GSP.
+/// Pulls OCI layers directly from TSC swarm peers via GSP.
 pub struct GhostFetcher {
-    /// The BLAKE3 hash of the target OCI image used for integrity verification.
+    /// BLAKE3 hash of the target OCI image (used for DHT lookup and integrity check).
     pub target_image_hash: String,
 }
 
 impl GhostFetcher {
     /// Initiates a BitTorrent-style pull of OCI layers from the TSC swarm.
+    ///
+    /// **Phase 3.2 stub** — will query the DHT for providers and pull via GspConnection.
     pub async fn pull_from_swarm(&self) -> Result<(), String> {
-        // Implementation will interface with tsc-net DHT to find providers
+        // TODO(Phase 3.2): query DHT for providers of self.target_image_hash
+        // TODO(Phase 3.2): open GspConnection to each provider, pull layers
+        // TODO(Phase 3.2): verify each layer with BLAKE3(layer) == expected_hash
         Ok(())
     }
 }

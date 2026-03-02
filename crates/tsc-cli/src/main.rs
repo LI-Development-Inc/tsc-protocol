@@ -100,7 +100,17 @@ fn parse_command(args: &[String]) -> Result<GhostCommand, String> {
             }
         }
 
-        "rotate-key" => Ok(GhostCommand::RotateKey),
+        "rotate-key" => {
+            // Read from env — never stored in daemon memory
+            let mnemonic = std::env::var("TSC_MNEMONIC")
+                .unwrap_or_default();
+            if mnemonic.trim().is_empty() {
+                return Err(
+                    "Set TSC_MNEMONIC=\"word1 ... word24\" before running rotate-key".into()
+                );
+            }
+            Ok(GhostCommand::RotateKey { mnemonic: mnemonic.trim().to_string() })
+        }
 
         "help" | "--help" | "-h" => {
             print_help();

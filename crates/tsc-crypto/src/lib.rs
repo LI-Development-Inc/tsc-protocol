@@ -3,15 +3,16 @@
 
 //! # tsc-crypto — Identity Domain (Root of Trust)
 //!
-//! No network socket access. No unsafe code. Every other TSC crate depends
-//! on this one.
+//! No network access. No unsafe code. Every other TSC crate depends on this.
 //!
 //! ## Modules
-//! - [`bip39`]  — BIP-39 mnemonic generation + SLIP-0010 key derivation
+//! - [`bip39`]  — BIP-39 mnemonic generation and SLIP-0010 key derivation
 //! - [`keri`]   — KERI-lite event chain and verification engine
 //! - [`vault`]  — Argon2id + ChaCha20-Poly1305 encrypted mnemonic vault
+//! - [`iel`]    — Identifier Event Log persistence (append-only JSONL)
 
 pub mod bip39;
+pub mod iel;
 pub mod keri;
 pub mod vault;
 
@@ -65,62 +66,104 @@ pub enum CryptoError {
 /// The runtime identity of a TSC node.
 ///
 /// Always derived from a BIP-39 mnemonic via SLIP-0010.
-/// MUST NOT be constructed from raw random bytes.
+///
+/// # Rotation counter
+///
+/// `rotation` tracks how many key rotations have occurred.  At inception it
+/// is `0`.  After the first `rotate()` it is `1`, and so on.  The active
+/// SLIP-0010 derivation index is always `rotation`; the pre-rotation index
+/// is `rotation + 1`.
 ///
 /// # Zeroization
 ///
-/// We cannot `#[derive(ZeroizeOnDrop)]` because:
-/// - `SigningKey` uses its own `Drop`-based zeroization (not `DefaultIsZeroes`)
-/// - `Vec<KeyEvent>` does not implement `Zeroize`
-///
-/// We instead implement `Drop` manually: the `active_key` scalar is zeroed
-/// via `SigningKey`'s own `Drop`, and `next_key_commitment` is zeroed
-/// explicitly. The `event_log` and `ghost_id` contain only public data, so
-/// zeroing them is not a security requirement.
+/// Manual `Drop`: `next_key_commitment` is zeroized explicitly; `active_key`
+/// zeroes itself via `SigningKey`'s own `Drop`.
 pub struct Persona {
-    /// Permanent GhostID: hex-encoded BLAKE3 hash of the Inception Event.
-    /// Stable across all key rotations.
+    /// Permanent GhostID (BLAKE3 of InceptionEvent, hex). Stable forever.
     pub ghost_id: String,
 
-    /// Current Ed25519 signing key (K1).
-    /// Zeroed automatically by `SigningKey`'s own `Drop` implementation.
+    /// Current active signing key (K_N). Zeroed by `SigningKey::drop()`.
     pub active_key: SigningKey,
 
-    /// Pre-rotation commitment: `BLAKE3(K2.verifying_key_bytes)`.
-    /// Stored in the `n` field of every KERI event. Must not be all-zero.
+    /// Pre-rotation commitment `BLAKE3(K_(N+1).pub)`. Zeroed in `drop()`.
     pub next_key_commitment: [u8; 32],
 
-    /// Ordered Identifier Event Log (public data; not zeroed on drop).
+    /// Number of rotations performed (0 = just after inception).
+    pub rotation: u32,
+
+    /// Ordered Identifier Event Log. Contains public data only.
     pub event_log: Vec<keri::KeyEvent>,
 }
 
 impl Drop for Persona {
     fn drop(&mut self) {
-        // next_key_commitment is sensitive — zero it explicitly.
-        // active_key is zeroed by SigningKey's own Drop.
         self.next_key_commitment.zeroize();
     }
 }
 
 impl Persona {
     /// Derives a `Persona` from a BIP-39 master seed (the only valid constructor).
-    ///
-    /// Uses SLIP-0010 to derive K1 and K2, computes the pre-rotation
-    /// commitment (`BLAKE3(K2.pub)`), and creates the signed KERI
-    /// Inception Event.
     pub fn from_seed(master_seed: &[u8]) -> Result<Self, CryptoError> {
-        let active_key  = bip39::derive_active_key(master_seed)?;
-        let commitment  = bip39::prerotation_commitment(master_seed)?;
-
-        let inception = keri::InceptionEvent::new(&active_key, commitment)?;
-        let ghost_id  = hex::encode(inception.calculate_digest()?);
+        let active_key = bip39::derive_active_key(master_seed)?;
+        let commitment = bip39::prerotation_commitment(master_seed)?;
+        let inception  = keri::InceptionEvent::new(&active_key, commitment)?;
+        let ghost_id   = hex::encode(inception.calculate_digest()?);
 
         Ok(Self {
             ghost_id,
             active_key,
             next_key_commitment: commitment,
+            rotation: 0,
             event_log: vec![keri::KeyEvent::Inception(inception)],
         })
+    }
+
+    /// Performs one key rotation in-place.
+    ///
+    /// Derives the new active key (K_(N+1)) and the next pre-rotation key
+    /// (K_(N+2)) from `master_seed`.  Builds and dual-signs a `RotationEvent`,
+    /// appends it to the in-memory IEL, and updates `active_key`,
+    /// `next_key_commitment`, and `rotation`.
+    ///
+    /// The caller is responsible for persisting the IEL after this returns.
+    pub fn rotate(&mut self, master_seed: &[u8]) -> Result<&keri::RotationEvent, CryptoError> {
+        let next_rotation = self.rotation + 1;
+
+        // Derive the new active key (former pre-rotation key, index N+1)
+        let new_active = bip39::derive_key_at_index(master_seed, next_rotation)?;
+
+        // Derive the new pre-rotation key (index N+2) and compute its commitment
+        let new_prerot_commitment = bip39::commitment_at_index(master_seed, next_rotation + 1)?;
+
+        // Hash of the last event in the log
+        let prev_event  = self.event_log.last()
+            .ok_or_else(|| CryptoError::InvalidEventLog("Empty event log".into()))?;
+        let prev_digest = prev_event.digest()?;
+        let seq         = prev_event.seq() + 1;
+
+        let deriv_path = format!("m/44'/7777'/0'/0/{}'", next_rotation);
+
+        let rot = keri::RotationEvent::new(
+            &self.active_key,
+            &new_active,
+            new_prerot_commitment,
+            prev_digest,
+            seq,
+            &self.ghost_id,
+            &deriv_path,
+        )?;
+
+        // Commit the rotation
+        self.event_log.push(keri::KeyEvent::Rotation(rot));
+        self.active_key         = new_active;
+        self.next_key_commitment = new_prerot_commitment;
+        self.rotation           = next_rotation;
+
+        // Return reference to the rotation event we just appended
+        match self.event_log.last() {
+            Some(keri::KeyEvent::Rotation(r)) => Ok(r),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -140,7 +183,7 @@ mod tests {
         let seed = bip39::restore_from_phrase(TEST_MNEMONIC).unwrap();
         let p1 = Persona::from_seed(&seed).unwrap();
         let p2 = Persona::from_seed(&seed).unwrap();
-        assert_eq!(p1.ghost_id, p2.ghost_id, "same seed must produce same GhostID");
+        assert_eq!(p1.ghost_id, p2.ghost_id);
     }
 
     #[test]
@@ -155,5 +198,43 @@ mod tests {
         let seed = bip39::restore_from_phrase(TEST_MNEMONIC).unwrap();
         let p = Persona::from_seed(&seed).unwrap();
         assert_ne!(p.next_key_commitment, [0u8; 32]);
+    }
+
+    #[test]
+    fn persona_rotate_updates_fields() {
+        let seed       = bip39::restore_from_phrase(TEST_MNEMONIC).unwrap();
+        let mut p      = Persona::from_seed(&seed).unwrap();
+        let ghost_before = p.ghost_id.clone();
+        let key_before   = p.active_key.verifying_key().to_bytes();
+
+        p.rotate(&seed).unwrap();
+
+        // GhostID must NOT change
+        assert_eq!(p.ghost_id, ghost_before, "GhostID must be stable across rotation");
+        // Active key MUST change
+        assert_ne!(p.active_key.verifying_key().to_bytes(), key_before);
+        // Rotation counter incremented
+        assert_eq!(p.rotation, 1);
+        // IEL now has 2 events
+        assert_eq!(p.event_log.len(), 2);
+    }
+
+    #[test]
+    fn persona_rotate_log_verifies() {
+        let seed  = bip39::restore_from_phrase(TEST_MNEMONIC).unwrap();
+        let mut p = Persona::from_seed(&seed).unwrap();
+        p.rotate(&seed).unwrap();
+        // The full IEL must verify cleanly
+        keri::verify_event_log(&p.event_log).expect("rotated IEL must verify");
+    }
+
+    #[test]
+    fn persona_double_rotate_verifies() {
+        let seed  = bip39::restore_from_phrase(TEST_MNEMONIC).unwrap();
+        let mut p = Persona::from_seed(&seed).unwrap();
+        p.rotate(&seed).unwrap();
+        p.rotate(&seed).unwrap();
+        assert_eq!(p.rotation, 2);
+        keri::verify_event_log(&p.event_log).expect("double-rotated IEL must verify");
     }
 }
