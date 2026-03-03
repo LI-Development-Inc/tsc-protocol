@@ -9,7 +9,6 @@
 
 | # | Issue | Fix |
 |---|-------|-----|
-
 | C1 | `next_key_commitment` hardcoded `[0u8;32]` | SLIP-0010 `prerotation_commitment()` in `bip39.rs` |
 | C2 | `seed[0..32]` used directly as Ed25519 key | Full SLIP-0010 derivation `m/44'/7777'/0'/0'/0'` |
 | C3 | Static Argon2id salt | 16-byte random salt per vault write, stored in header |
@@ -34,7 +33,6 @@
 stores an Argon2id vault, and resolves/connects/sends to the local GhostID.
 
 ### 1.1 — BIP-39 + SLIP-0010 (`bip39.rs`)
-
 - `generate_sovereign_entropy()` → 24-word mnemonic + 512-byte seed
 - `restore_from_phrase()` → validated BIP-39 restore
 - `derive_active_key()` → K1 at `m/44'/7777'/0'/0'/0'`
@@ -42,14 +40,12 @@ stores an Argon2id vault, and resolves/connects/sends to the local GhostID.
 - `prerotation_commitment()` → `BLAKE3(K2.verifying_key)`, K2 immediately zeroized
 
 ### 1.2 — KERI Inception Event (`keri.rs`, RFC-002)
-
 - `InceptionEvent::new()` → self-referential digest `d == i`, self-signed by K1
 - `InceptionEvent::verify_signature()` + `calculate_digest()`
 - `verify_event_log()` → walks full IXN→ROT→ROT chain with commitment checking
 - `RotationEvent::new()` → dual-signed by outgoing + incoming key
 
 ### 1.3 — Argon2id Vault (`vault.rs`, RFC-006)
-
 - Binary format: magic + version + random salt + random nonce + ciphertext
 - Argon2id: t=3, m=64MiB, p=4 — hardware UUID binding
 - ChaCha20-Poly1305 AEAD encryption
