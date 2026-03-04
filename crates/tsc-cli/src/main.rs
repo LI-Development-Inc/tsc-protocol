@@ -112,6 +112,25 @@ fn parse_command(args: &[String]) -> Result<GhostCommand, String> {
             Ok(GhostCommand::RotateKey { mnemonic: mnemonic.trim().to_string() })
         }
 
+        "connect-direct" => {
+            if args.len() < 3 {
+                Err("Usage: tsc-cli connect-direct <IP:PORT>".into())
+            } else {
+                Ok(GhostCommand::ConnectDirect { addr: args[2].clone() })
+            }
+        }
+
+        "send-direct" => {
+            if args.len() < 4 {
+                Err("Usage: tsc-cli send-direct <IP:PORT> \"<message>\"".into())
+            } else {
+                Ok(GhostCommand::SendDirect {
+                    addr:    args[2].clone(),
+                    content: args[3..].join(" "),
+                })
+            }
+        }
+
         "help" | "--help" | "-h" => {
             print_help();
             std::process::exit(0);
@@ -159,6 +178,13 @@ fn print_response(resp: GhostResponse) {
 
         GhostResponse::LinkEstablished { remote_id, addr } => {
             println!("[+] GSP Link Active: {} @ {}", remote_id, addr);
+        }
+
+        GhostResponse::DirectLinkEstablished { remote_id, addr } => {
+            println!("[+] GSP Direct Link: {} @ {}", remote_id, addr);
+            if remote_id == "unverified" {
+                eprintln!("[~] Peer is in ephemeral mode — no KERI verification performed.");
+            }
         }
 
         GhostResponse::MessageSent { target_id } => {
@@ -232,17 +258,26 @@ fn print_help() {
     println!("USAGE:");
     println!("  tsc-cli <COMMAND> [ARGS]");
     println!();
-    println!("COMMANDS:");
-    println!("  ping                        Heartbeat check");
-    println!("  init                        Create a new sovereign identity");
-    println!("  recover \"<mnemonic>\"        Restore identity from 24-word seed");
-    println!("  status                      Show daemon status");
-    println!("  resolve <GHOST_ID>          Resolve a GhostID to a network address");
-    println!("  connect <GHOST_ID>          Establish a GSP link");
-    println!("  send <GHOST_ID> <msg>       Send an encrypted message");
-    println!("  spawn <IMAGE_HASH> [VAULT]  Spawn a Ghost-Box");
-    println!("  list                        List running Ghosts");
-    println!("  stop <GHOST_ID>             Stop a running Ghost");
-    println!("  rotate-key                  Rotate the active signing key (KERI)");
-    println!("  help                        Show this message");
+    println!("IDENTITY");
+    println!("  ping                            Heartbeat check");
+    println!("  init                            Create a new sovereign identity");
+    println!("  recover \"<mnemonic>\"            Restore identity from 24-word seed");
+    println!("  status                          Show daemon status");
+    println!("  rotate-key                      Rotate signing key (KERI) — needs TSC_MNEMONIC");
+    println!();
+    println!("NETWORKING (DHT-resolved)");
+    println!("  resolve <GHOST_ID>              Resolve a GhostID to IP:port via DHT");
+    println!("  connect <GHOST_ID>              Establish a GSP link via DHT");
+    println!("  send    <GHOST_ID> <msg>        Send a message via DHT resolution");
+    println!();
+    println!("NETWORKING (direct IP — bypasses DHT)");
+    println!("  connect-direct <IP:PORT>        GSP HELLO handshake to explicit address");
+    println!("  send-direct    <IP:PORT> <msg>  Send a message to explicit address");
+    println!();
+    println!("GHOST RUNTIME (Phase 3 — stubs)");
+    println!("  spawn <IMAGE_HASH> [VAULT]      Spawn a Ghost-Box");
+    println!("  list                            List running Ghosts");
+    println!("  stop  <GHOST_ID>                Stop a running Ghost");
+    println!();
+    println!("  help                            Show this message");
 }

@@ -368,6 +368,62 @@ async fn dispatch(
             }
         }
 
+        // ── Connect Direct (bypass DHT — Phase 2.1 cross-node testing) ──────
+        //
+        // Dials a peer by explicit IP:port rather than DHT lookup.
+        // Performs the full GSP HELLO handshake and returns the KERI-verified
+        // GhostID learned from the peer's inception event.
+        //
+        // Usage: tsc-cli connect-direct <ip>:<port>
+        GhostCommand::ConnectDirect { addr } => {
+            let sock_addr: std::net::SocketAddr = match addr.parse() {
+                Ok(a)  => a,
+                Err(_) => return GhostResponse::Err(
+                    format!("NET:BAD_ADDR: '{}' is not a valid IP:port", addr)
+                ),
+            };
+            match net_stack.connect(sock_addr).await {
+                Ok(conn) => GhostResponse::DirectLinkEstablished {
+                    remote_id: conn.remote_ghost_id,
+                    addr,
+                },
+                Err(e) => GhostResponse::Err(format!("NET:CONNECT_DIRECT: {}", e)),
+            }
+        }
+
+        // ── Send Direct (bypass DHT — Phase 2.1 cross-node testing) ─────────
+        //
+        // Opens a fresh QUIC connection to IP:port, performs GSP HELLO,
+        // then sends a Data frame.  No connection pool; each call is independent.
+        //
+        // Usage: tsc-cli send-direct <ip>:<port> "<message>"
+        GhostCommand::SendDirect { addr, content } => {
+            let sock_addr: std::net::SocketAddr = match addr.parse() {
+                Ok(a)  => a,
+                Err(_) => return GhostResponse::Err(
+                    format!("NET:BAD_ADDR: '{}' is not a valid IP:port", addr)
+                ),
+            };
+            match net_stack.connect(sock_addr).await {
+                Ok(conn) => match conn.open_ghost_stream().await {
+                    Ok(mut send) => {
+                        let frame = tsc_net::gsp::GspFrame::new(
+                            tsc_net::gsp::MsgType::Data,
+                            content.into_bytes(),
+                        );
+                        let _ = send.write_all(&frame.to_bytes()).await;
+                        let _ = send.finish().await;
+                        GhostResponse::Ok(format!(
+                            "DIRECT: Message delivered to {} (peer: {})",
+                            addr, &conn.remote_ghost_id[..16.min(conn.remote_ghost_id.len())]
+                        ))
+                    }
+                    Err(e) => GhostResponse::Err(format!("NET:STREAM: {}", e)),
+                },
+                Err(e) => GhostResponse::Err(format!("NET:CONNECT_DIRECT: {}", e)),
+            }
+        }
+
         // ── Ghost lifecycle (Phase 3 — stubs) ────────────────────────────
         GhostCommand::SpawnGhost { image_hash, .. } => GhostResponse::Err(
             format!("RUNTIME:NOT_IMPL: SpawnGhost({}) — Phase 3 pending", image_hash),

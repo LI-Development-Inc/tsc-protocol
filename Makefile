@@ -13,7 +13,8 @@
 #
 # ENVIRONMENT VARIABLES (see .env.test.example)
 #   TSC_MNEMONIC   24-word BIP-39 phrase  (required: vault unlock, rotation)
-#   TSC_GHOST_B    Remote GhostID         (required: Phase 2 peer tests)
+#   TSC_GHOST_B    Remote GhostID         (optional: Phase 2 DHT-resolved tests)
+#   TSC_VPS_ADDR   Remote IP:port         (required: Phase 2.1 direct cross-node test)
 #
 # LOADING YOUR ENV
 #   cp .env.test.example .env.test    # fill in your mnemonic
@@ -360,14 +361,19 @@ test-p2: \
 test-p2-gsp-handshake: _require-daemon
 	@echo -e "$(CYN)[P2.1] GSP HELLO handshake + KERI verification$(RST)"
 	@echo -e "  $(GRN)[✓] Loopback verified$(RST) $(DIM)(daemon log shows 'GSP: Peer verified')$(RST)"
-	@echo -e "  $(YLW)[~] Cross-node (VPS) not yet validated$(RST)"
-	@echo -e "  $(DIM)VPS checklist:$(RST)"
-	@echo -e "  $(DIM)  [ ] rsync project to VPS: rsync -av . user@vps:~/tsc-work/$(RST)"
-	@echo -e "  $(DIM)  [ ] On VPS: bash scripts/vps-setup.sh$(RST)"
-	@echo -e "  $(DIM)  [ ] Open VPS firewall: 9090/tcp + 9090/udp$(RST)"
-	@echo -e "  $(DIM)  [ ] Add VPS GhostID to .env.test as TSC_GHOST_B$(RST)"
-	@echo -e "  $(DIM)  [ ] source .env.test && make test-p2$(RST)"
-	@echo -e "  $(DIM)  [ ] Confirm VPS log: [+] GSP: Peer verified: <local-id>$(RST)"
+	@if [ -n "$(TSC_VPS_ADDR)" ]; then \
+		echo -e "  $(GRN)[✓] TSC_VPS_ADDR set: $(TSC_VPS_ADDR)$(RST)"; \
+		echo -e "  $(DIM)Cross-node test: make test-p2-remote-connect$(RST)"; \
+	else \
+		echo -e "  $(YLW)[~] TSC_VPS_ADDR not set — cross-node handshake not validated$(RST)"; \
+		echo -e "  $(DIM)VPS checklist:$(RST)"; \
+		echo -e "  $(DIM)  1. rsync project:  rsync -av . user@vps:~/tsc-work/$(RST)"; \
+		echo -e "  $(DIM)  2. Build on VPS:   ssh user@vps 'cd tsc-work && cargo build'$(RST)"; \
+		echo -e "  $(DIM)  3. Start on VPS:   ssh user@vps 'cd tsc-work && make daemon-start'$(RST)"; \
+		echo -e "  $(DIM)  4. Open firewall:  9090/tcp + 9090/udp$(RST)"; \
+		echo -e "  $(DIM)  5. Set locally:    export TSC_VPS_ADDR=<vps-ip>:9090$(RST)"; \
+		echo -e "  $(DIM)  6. Rerun:          make test-p2$(RST)"; \
+	fi
 
 test-p2-peers: _require-daemon
 	@echo -e "$(CYN)[P2.2] mDNS peer count$(RST)"
@@ -381,19 +387,43 @@ test-p2-remote-resolve: _require-daemon _require-ghost-b
 	@echo -e "$(CYN)[P2.2] resolve remote GhostID via DHT$(RST)"
 	@$(CLI) resolve "$(TSC_GHOST_B)" | grep -q "Resolved:" \
 		&& echo -e "  $(GRN)[✓] resolved: $(TSC_GHOST_B)$(RST)" \
-		|| echo -e "  $(YLW)[~] NOT_FOUND — ensure both daemons are on same LAN$(RST)"
+		|| echo -e "  $(YLW)[~] NOT_FOUND — DHT resolution needs shared bootstrap peer$(RST)"
 
-test-p2-remote-connect: _require-daemon _require-ghost-b
-	@echo -e "$(CYN)[P2.1] connect to remote peer (exercises GSP handshake)$(RST)"
-	@$(CLI) connect "$(TSC_GHOST_B)" | grep -q "GSP Link Active" \
-		&& echo -e "  $(GRN)[✓] GSP link established$(RST)" \
-		|| echo -e "  $(YLW)[~] connect failed — peer offline or handshake rejected$(RST)"
+## Direct IP connect — bypasses DHT, validates GSP HELLO + KERI cross-node
+# Requires: TSC_VPS_ADDR=<ip>:9090 in your .env.test
+test-p2-remote-connect: _require-daemon
+	@echo -e "$(CYN)[P2.1] connect to remote peer (GSP HELLO + KERI)$(RST)"
+	@if [ -z "$(TSC_VPS_ADDR)" ] && [ -z "$(TSC_GHOST_B)" ]; then \
+		echo -e "  $(YLW)[~] TSC_VPS_ADDR not set — skipping direct connect test.$(RST)"; \
+		echo -e "  $(DIM)Set: export TSC_VPS_ADDR=<vps-ip>:9090$(RST)"; \
+	elif [ -n "$(TSC_VPS_ADDR)" ]; then \
+		RESULT=$$($(CLI) connect-direct "$(TSC_VPS_ADDR)" 2>&1); \
+		echo "$$RESULT" | grep -q "GSP Direct Link" \
+			&& echo -e "  $(GRN)[✓] GSP HELLO handshake verified$(RST)" \
+			&& echo "  $$(echo "$$RESULT" | grep 'GSP Direct Link')" \
+			|| { echo -e "  $(RED)[✗] connect-direct failed$(RST)"; echo "  $$RESULT"; }; \
+	else \
+		$(CLI) connect "$(TSC_GHOST_B)" | grep -q "GSP Link Active" \
+			&& echo -e "  $(GRN)[✓] GSP link established via DHT$(RST)" \
+			|| echo -e "  $(YLW)[~] connect failed — peer offline or DHT miss$(RST)"; \
+	fi
 
-test-p2-remote-send: _require-daemon _require-ghost-b
+test-p2-remote-send: _require-daemon
 	@echo -e "$(CYN)[P2.2] send message to remote peer$(RST)"
-	@$(CLI) send "$(TSC_GHOST_B)" "test-p2: cross-node hello" | grep -q "delivered" \
-		&& echo -e "  $(GRN)[✓] message delivered$(RST)" \
-		|| echo -e "  $(YLW)[~] delivery failed — peer may be offline$(RST)"
+	@if [ -z "$(TSC_VPS_ADDR)" ] && [ -z "$(TSC_GHOST_B)" ]; then \
+		echo -e "  $(YLW)[~] TSC_VPS_ADDR not set — skipping direct send test.$(RST)"; \
+		echo -e "  $(DIM)Set: export TSC_VPS_ADDR=<vps-ip>:9090$(RST)"; \
+	elif [ -n "$(TSC_VPS_ADDR)" ]; then \
+		RESULT=$$($(CLI) send-direct "$(TSC_VPS_ADDR)" "test-p2: cross-node hello" 2>&1); \
+		echo "$$RESULT" | grep -q "DIRECT: Message delivered" \
+			&& echo -e "  $(GRN)[✓] message delivered$(RST)" \
+			&& echo "  $$(echo "$$RESULT" | grep DIRECT)" \
+			|| { echo -e "  $(RED)[✗] send-direct failed$(RST)"; echo "  $$RESULT"; }; \
+	else \
+		$(CLI) send "$(TSC_GHOST_B)" "test-p2: cross-node hello" | grep -q "delivered" \
+			&& echo -e "  $(GRN)[✓] message delivered$(RST)" \
+			|| echo -e "  $(YLW)[~] delivery failed — peer may be offline$(RST)"; \
+	fi
 
 test-p2-morph: _require-daemon
 	@echo -e "$(CYN)[P2.3] traffic morphing / chaff injection$(RST)"
