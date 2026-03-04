@@ -86,6 +86,30 @@ pub enum GhostCommand {
         /// The BIP-39 mnemonic phrase authorizing this rotation.
         mnemonic: String,
     },
+
+    /// Connect directly to a peer by IP:port, bypassing DHT resolution.
+    ///
+    /// Used for cross-internet testing before bootstrap nodes are configured.
+    /// The remote peer's GhostID is returned after the KERI HELLO handshake.
+    ///
+    /// Example: `tsc-cli connect-direct 1.2.3.4:9090`
+    ConnectDirect {
+        /// Socket address of the remote peer, e.g. `"1.2.3.4:9090"`.
+        addr: String,
+    },
+
+    /// Send a message to a peer by IP:port, bypassing DHT resolution.
+    ///
+    /// Performs a fresh QUIC + GSP HELLO per call (no persistent connection pool yet).
+    /// Useful for Phase 2.1/2.2 cross-node validation before bootstrap nodes exist.
+    ///
+    /// Example: `tsc-cli send-direct 1.2.3.4:9090 "hello from local"`
+    SendDirect {
+        /// Socket address of the remote peer, e.g. `"1.2.3.4:9090"`.
+        addr: String,
+        /// Message content to deliver.
+        content: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -123,6 +147,17 @@ pub enum GhostResponse {
         /// The remote peer's GhostID.
         remote_id: String,
         /// The address the connection was made to.
+        addr: String,
+    },
+
+    /// GSP direct link established (ConnectDirect — no DHT lookup).
+    ///
+    /// Returns the KERI-verified GhostID of the remote peer, learned during HELLO.
+    DirectLinkEstablished {
+        /// KERI-verified GhostID of the remote peer (from their HELLO frame).
+        /// Will be `"unverified"` if the peer is in ephemeral mode.
+        remote_id: String,
+        /// The address that was dialled.
         addr: String,
     },
 
